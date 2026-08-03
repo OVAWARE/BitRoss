@@ -18,26 +18,29 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
-# Globals
-image_size = 1024
+# Globals — keep vision inputs modest; 16x16 sprites don't need 1024px embeds
+image_size = 128
 processed_files = 0
 file_count = 0
 write_lock = threading.Lock()
 stop_display = threading.Event()
 
 
-# Encode in-memory image to base64
 def encode_image_to_base64(image):
     buffered = io.BytesIO()
     image.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 
-# Resize base64-decoded image
-def resize_image(base64_data, size):
+def resize_base64_image(base64_data, size):
+    """Decode once, nearest-neighbor resize, re-encode for the vision API."""
     image_data = base64.b64decode(base64_data)
     with Image.open(io.BytesIO(image_data)).convert("RGBA") as img:
-        return img.resize(size, resample=Image.NEAREST)
+        # Skip work when already at/near target (common for item PNGs)
+        if img.size == size:
+            return base64_data
+        resized = img.resize(size, resample=Image.NEAREST)
+        return encode_image_to_base64(resized)
 
 
 # Save per-thread metadata
@@ -58,8 +61,7 @@ def write_metadata(file_name, project_id, description, keywords, thread_id):
 def describe_image(file_name, project_id, base64_data):
     global processed_files
     try:
-        resized_image = resize_image(base64_data, (image_size, image_size))
-        encoded_image = encode_image_to_base64(resized_image)
+        encoded_image = resize_base64_image(base64_data, (image_size, image_size))
 
         prompt = (
             f"Describe this image in one sentence and a set of keywords. As a hint, the filename is {file_name}. "
@@ -73,6 +75,8 @@ def describe_image(file_name, project_id, base64_data):
             "prompt": prompt,
             "images": [encoded_image],
             "stream": False,
+            "format": "json",
+            "options": {"temperature": 0},
         }
 
         response = requests.post("http://localhost:11434/api/generate", json=payload)
