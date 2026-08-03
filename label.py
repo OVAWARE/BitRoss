@@ -21,7 +21,9 @@ client = OpenAI(
 )
 logging.basicConfig(filename='error.log', level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
 
-image_size = 1024
+# Pixel-art items are typically 16x16; upscaling to 1024 burns tokens/cost
+# without improving captions. 128 is plenty for Gemini Flash vision.
+image_size = 128
 total_cost = 0.0
 average_cost = 0.0
 processed_files = 0
