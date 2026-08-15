@@ -4,6 +4,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -430,6 +431,8 @@ def train_one_epoch(
     n_samples = 0
     amp_enabled = use_amp and device.type == "cuda"
     scaler_enabled = scaler.is_enabled() if scaler is not None else False
+    last_t = time.perf_counter()
+    last_n = 0
 
     for batch_idx, batch in enumerate(train_loader):
         data, input_ids, attention_mask = batch
@@ -466,13 +469,25 @@ def train_one_epoch(
         train_loss += loss.item() * bs
         n_samples += bs
 
-        if log_wandb and batch_idx % log_every == 0:
-            wandb.log(
-                {
-                    "batch_loss": loss.item(),
-                    "batch_t_mean": t_mean.item() if torch.is_tensor(t_mean) else float(t_mean),
-                }
+        if batch_idx == 0 or batch_idx % log_every == 0:
+            now = time.perf_counter()
+            dt = max(now - last_t, 1e-6)
+            ips = (n_samples - last_n) / dt if batch_idx else bs / dt
+            last_t = now
+            last_n = n_samples
+            mem = _vram_msg(device)
+            print(
+                f"  step {batch_idx:>5}  loss={loss.item():.4f}  {ips:.0f} img/s{mem}",
+                flush=True,
             )
+            if log_wandb:
+                wandb.log(
+                    {
+                        "batch_loss": loss.item(),
+                        "batch_t_mean": t_mean.item() if torch.is_tensor(t_mean) else float(t_mean),
+                        "img_per_s": ips,
+                    }
+                )
 
     return train_loss / max(n_samples, 1)
 
@@ -525,18 +540,27 @@ def find_latest_checkpoint(save_dir, model_name="BitRoss"):
     return max(ckpts, key=lambda p: p.stat().st_mtime)
 
 
+def _vram_msg(device) -> str:
+    if device is None or getattr(device, "type", None) != "cuda":
+        return ""
+    alloc = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    return f"  vram {alloc:.1f}/{total:.1f} GB (reserved {reserved:.1f})"
+
+
 def auto_batch_size(requested: int, device: torch.device) -> int:
-    """L4 22GB OOM'd at 512 when grads went through CLIP. Frozen CLIP + checkpointed DiT fits 128."""
+    """Frozen CLIP + 16x16 DiT. L4 can take a large batch; fit_batch_size halves on OOM."""
     if requested and requested > 0:
         return requested
     if device.type != "cuda":
         return 32
     vram = torch.cuda.get_device_properties(0).total_memory
     if vram >= 20 * 1024**3:
-        return 128
+        return 1024
     if vram >= 12 * 1024**3:
-        return 64
-    return 32
+        return 256
+    return 128
 
 
 def make_loader(dataset, batch_size, device, num_workers):
@@ -621,7 +645,7 @@ def parse_args():
         "--batch_size",
         type=int,
         default=0,
-        help="0 = auto from GPU VRAM (128 on L4, 64 on T4; shrinks on OOM)",
+        help="0 = auto from GPU VRAM (1024 on L4, 256 on T4; shrinks on OOM)",
     )
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--num_workers", type=int, default=0, help="0 is fastest for the packed RAM cache")
@@ -820,16 +844,41 @@ def main():
             print(f"torch.compile skipped: {e}")
 
     if device.type == "cuda":
-        BATCH_SIZE, train_loader = fit_batch_size(
-            model,
-            dataset,
-            BATCH_SIZE,
-            device,
-            optimizer,
-            scaler,
-            USE_AMP,
-            amp_dtype,
-            num_workers,
+        model.dit.grad_checkpoint = False
+        try:
+            BATCH_SIZE, train_loader = fit_batch_size(
+                model,
+                dataset,
+                BATCH_SIZE,
+                device,
+                optimizer,
+                scaler,
+                USE_AMP,
+                amp_dtype,
+                num_workers,
+            )
+        except RuntimeError:
+            print("OOM without checkpointing; enabling DiT gradient checkpointing and retrying")
+            model.dit.grad_checkpoint = True
+            BATCH_SIZE = auto_batch_size(args.batch_size, device)
+            BATCH_SIZE, train_loader = fit_batch_size(
+                model,
+                dataset,
+                BATCH_SIZE,
+                device,
+                optimizer,
+                scaler,
+                USE_AMP,
+                amp_dtype,
+                num_workers,
+            )
+        print(
+            f"Training batch={BATCH_SIZE}  checkpoint={model.dit.grad_checkpoint}"
+            f"{_vram_msg(device)}"
+        )
+        print(
+            "Colab GPU RAM staying flat is normal — PyTorch reuses one allocation. "
+            "Watch img/s in the step log, not the graph spikes."
         )
     else:
         train_loader = make_loader(dataset, BATCH_SIZE, device, num_workers)

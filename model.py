@@ -246,7 +246,9 @@ class PixelDiT(nn.Module):
         )
         self.blocks = nn.ModuleList([DiTBlock(dim, heads) for _ in range(depth)])
         self.final = FinalLayer(dim, channels)
-        self.grad_checkpoint = True
+        # Off by default: 16x16 + frozen CLIP fits an L4 without it, and
+        # checkpointing is what kept Colab GPU RAM stuck around 2GB.
+        self.grad_checkpoint = False
 
     def forward(self, x, t, pooled, text_seq):
         b, c, h, w = x.shape
