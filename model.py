@@ -30,6 +30,31 @@ CLIP_MAX_LEN = 77
 N_CTX = 4  # CoOp prefix tokens inserted after BOS
 OFFSET_NOISE = 0.1
 
+try:
+    from transformers.masking_utils import create_causal_mask as _hf_create_causal_mask
+except Exception:  # older transformers
+    _hf_create_causal_mask = None
+
+
+def _clip_causal_mask(text_model, hidden_states, attention_mask):
+    """Build CLIP's causal + padding mask across transformers 4.x/5.x."""
+    if _hf_create_causal_mask is not None:
+        return _hf_create_causal_mask(
+            config=text_model.config,
+            inputs_embeds=hidden_states,
+            attention_mask=attention_mask,
+            past_key_values=None,
+        )
+    # Fallback: additive mask (0 keep, large negative drop) with causal triangle.
+    b, n, _ = hidden_states.shape
+    causal = torch.ones(n, n, device=hidden_states.device, dtype=hidden_states.dtype)
+    causal = torch.triu(causal, diagonal=1) * -1e4
+    mask = causal.unsqueeze(0).unsqueeze(0).expand(b, 1, n, n).clone()
+    if attention_mask is not None:
+        pad = (1.0 - attention_mask.to(dtype=hidden_states.dtype)[:, None, None, :]) * -1e4
+        mask = mask + pad
+    return mask
+
 # Kept so older imports don't explode; unused by the flow model.
 LATENT_DIM = 256
 HIDDEN_DIM = TEXT_DIM
@@ -133,23 +158,22 @@ class CLIPTextEncoder(nn.Module):
         )
 
         hidden_states = text_model.embeddings(inputs_embeds=embeds)
-        from transformers.masking_utils import create_causal_mask
-
-        causal_mask = create_causal_mask(
-            config=text_model.config,
-            inputs_embeds=hidden_states,
-            attention_mask=mask,
-            past_key_values=None,
-        )
-        encoder_out = text_model.encoder(
-            inputs_embeds=hidden_states,
-            attention_mask=causal_mask,
-            is_causal=True,
-        )
+        causal_mask = _clip_causal_mask(text_model, hidden_states, mask)
+        encoder_kwargs = {"inputs_embeds": hidden_states, "attention_mask": causal_mask}
+        try:
+            encoder_out = text_model.encoder(**encoder_kwargs, is_causal=True)
+        except TypeError:
+            encoder_out = text_model.encoder(**encoder_kwargs)
         hidden = text_model.final_layer_norm(encoder_out.last_hidden_state)
 
-        # CLIP EOS is the max token id; inserting prefix after BOS shifts it by n_ctx.
-        eos_pos = input_ids.argmax(dim=-1) + self.n_ctx
+        # Official CLIP pools at EOS; CoOp tokens inserted after BOS shift that index.
+        eos_id = getattr(text_model, "eos_token_id", None)
+        if eos_id is None:
+            eos_id = getattr(text_model.config, "eos_token_id", 49407)
+        if int(eos_id) == 2:
+            eos_pos = input_ids.to(dtype=torch.int).argmax(dim=-1) + self.n_ctx
+        else:
+            eos_pos = (input_ids == eos_id).to(dtype=torch.int).argmax(dim=-1) + self.n_ctx
         eos_pos = eos_pos.clamp(max=hidden.size(1) - 1)
         pooled = hidden[torch.arange(bsz, device=hidden.device), eos_pos]
         return self.proj_pool(pooled), self.proj_seq(hidden)

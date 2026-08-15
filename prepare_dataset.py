@@ -27,6 +27,9 @@ HF_DATASET = "OVAWARE/16xModdedMinecraft"
 ALPHA_LO = 0.01  # drop if >= 99% fully transparent
 ALPHA_HI = 0.99  # drop if >= 99% opaque
 ALPHA_CUTOFF = 8  # 0-255; treat below this as transparent
+IMAGE_SIZE = 16
+PACK_IMAGES = "images_u8.npy"
+PACK_CAPTIONS = "captions.json"
 
 JUNK_NAMES = {
     "missing",
@@ -184,7 +187,46 @@ def prepare(
     }
     (out_path / "prepare_stats.json").write_text(json.dumps(stats, indent=2))
     print(json.dumps(stats, indent=2))
+    write_packed_cache(ds, out_path)
     return ds
+
+
+def write_packed_cache(ds, out_dir) -> None:
+    """Uint8 NHWC tensor + captions so training does not decode PNG every epoch."""
+    out_path = Path(out_dir)
+    n = len(ds)
+    images = np.empty((n, IMAGE_SIZE, IMAGE_SIZE, 4), dtype=np.uint8)
+    captions = []
+    print(f"Packing {n:,} sprites to {out_path / PACK_IMAGES} ...")
+    for i, row in enumerate(ds):
+        img = _as_pil(row["image"]).convert("RGBA")
+        if img.size != (IMAGE_SIZE, IMAGE_SIZE):
+            img = img.resize((IMAGE_SIZE, IMAGE_SIZE), Image.NEAREST)
+        images[i] = np.asarray(img, dtype=np.uint8)
+        captions.append(str(row.get("caption") or caption_from_row(row.get("file_name", ""), row.get("mod_slug") or "")))
+        if i and i % 100000 == 0:
+            print(f"  packed {i:,}/{n:,}")
+    tmp = out_path / (PACK_IMAGES + ".partial")
+    with open(tmp, "wb") as f:
+        np.save(f, images)
+    os.replace(tmp, out_path / PACK_IMAGES)
+    cap_tmp = out_path / (PACK_CAPTIONS + ".partial")
+    cap_tmp.write_text(json.dumps(captions))
+    os.replace(cap_tmp, out_path / PACK_CAPTIONS)
+    print(f"Packed cache: {images.shape} {images.nbytes / 1e6:.0f} MB, {len(captions):,} captions")
+
+
+def load_packed_cache(out_dir):
+    out_path = Path(out_dir)
+    img_path = out_path / PACK_IMAGES
+    cap_path = out_path / PACK_CAPTIONS
+    if not img_path.exists() or not cap_path.exists():
+        return None
+    images = np.load(img_path)
+    captions = json.loads(cap_path.read_text())
+    if len(images) != len(captions):
+        raise ValueError(f"Packed cache length mismatch: {len(images)} images vs {len(captions)} captions")
+    return images, captions
 
 
 def _synthetic_image(kind: str) -> Image.Image:

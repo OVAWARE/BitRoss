@@ -108,6 +108,8 @@ def load_model(model_path, device):
         state = raw
     state = _strip_compile_prefix(state)
     missing, unexpected = model.load_state_dict(state, strict=False)
+    missing = [k for k in missing if "text_encoder.clip." not in k]
+    unexpected = [k for k in unexpected if "text_encoder.clip." not in k]
     if missing:
         print(f"Warning: missing keys when loading {model_path}: {missing[:8]}...")
     if unexpected:
