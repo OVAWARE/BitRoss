@@ -70,7 +70,7 @@ This Cursor environment has no GPU. Train on Colab:
 
 1. **Runtime → Change runtime type → L4** (T4 fallback; skip A100)
 2. Accept terms on [OVAWARE/16xModdedMinecraft](https://huggingface.co/datasets/OVAWARE/16xModdedMinecraft) and paste `HF_TOKEN` in the prepare cell (or add a Colab secret with that name). Do not commit the token.
-3. Run the notebook. It downloads the Hub dump, keeps `type=item` sprites that are not ~empty and not ~fully opaque, captions from `file_name` + `mod_slug`, caches a packed `images_u8.npy` to Drive, copies it to local disk, then trains. Checkpoints are atomic `BitRoss_latest.pth` plus two rotated epoch files.
+3. Run the notebook. It downloads the Hub dump, keeps `type=item` sprites that are not ~empty and not ~fully opaque, captions from the **item filename only** (no mod names), caches a packed `images_u8.npy` to Drive, copies it to local disk, then trains. Checkpoints are atomic `BitRoss_latest.pth` plus two rotated epoch files.
 
 ```bash
 export HF_TOKEN=hf_...

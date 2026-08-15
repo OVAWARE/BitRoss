@@ -7,7 +7,8 @@ The Hub dataset is gated parquet (~1.03M rows, 16x16 RGBA). Columns:
 
 There are no text captions. `type` is `item` or `block`. We keep items whose
 alpha is mixed (drop ~empty and ~fully-opaque tiles) and build CLIP captions
-from the filename + mod slug.
+from the item filename only (`diamond_sword.png` → `pixel art minecraft item, diamond sword`).
+Mod slugs are never in the prompt.
 
 Processed output is a Hugging Face save_to_disk cache (not 500k tiny PNGs).
 """
@@ -119,13 +120,7 @@ def filter_batch(batch, lo=ALPHA_LO, hi=ALPHA_HI):
 
 
 def add_captions_batch(batch):
-    captions = [
-        caption_from_row(fn, slug or "", author or "")
-        for fn, slug, author in zip(
-            batch["file_name"], batch["mod_slug"], batch["author"]
-        )
-    ]
-    return {"caption": captions}
+    return {"caption": [caption_from_row(fn) for fn in batch["file_name"]]}
 
 
 def prepare(
@@ -209,7 +204,7 @@ def write_packed_cache(ds, out_dir) -> None:
         if img.size != (IMAGE_SIZE, IMAGE_SIZE):
             img = img.resize((IMAGE_SIZE, IMAGE_SIZE), Image.NEAREST)
         images[i] = np.asarray(img, dtype=np.uint8)
-        captions.append(str(row.get("caption") or caption_from_row(row.get("file_name", ""), row.get("mod_slug") or "")))
+        captions.append(strip_mod_clause(row.get("caption") or caption_from_row(row.get("file_name", ""))))
         if i and i % 100000 == 0:
             print(f"  packed {i:,}/{n:,}")
     tmp = out_path / (PACK_IMAGES + ".partial")
