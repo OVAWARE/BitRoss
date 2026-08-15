@@ -6,18 +6,24 @@ import numpy as np
 import torch
 from PIL import Image
 from torchvision import transforms
-from transformers import BertTokenizer
+from transformers import CLIPTokenizer
 
 from model import (
-    CVAE,
+    CLIP_ID,
     IMAGE_SIZE,
-    LATENT_DIM,
-    TEXT_DIM,
-    TextEncoder,
-    decode_with_cfg,
+    BitRoss,
+    sample_rectified_flow,
+    tokenize_prompts,
 )
 
-tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+_tokenizer = None
+
+
+def get_tokenizer():
+    global _tokenizer
+    if _tokenizer is None:
+        _tokenizer = CLIPTokenizer.from_pretrained(CLIP_ID)
+    return _tokenizer
 
 
 def clean_image(image, threshold=0.75):
@@ -43,34 +49,45 @@ def generate_image(
     device,
     input_image=None,
     img_control=0.5,
-    cfg_scale=2.0,
+    cfg_scale=2.5,
     temperature=1.0,
+    steps=20,
+    tokenizer=None,
+    sampler="heun",
 ):
-    encoded_input = tokenizer(
-        text_prompt, padding=True, truncation=True, max_length=80, return_tensors="pt"
-    )
-    input_ids = encoded_input["input_ids"].to(device)
-    attention_mask = encoded_input["attention_mask"].to(device)
+    tokenizer = tokenizer or get_tokenizer()
+    input_ids, attention_mask = tokenize_prompts(tokenizer, [text_prompt], device)
 
     with torch.no_grad():
-        text_encoding = model.text_encoder(input_ids, attention_mask)
-        z = torch.randn(1, LATENT_DIM, device=device) * temperature
-
+        pooled, seq = model.encode_text(input_ids, attention_mask, drop_p=0.0)
+        x_start = None
+        t_start = 1.0
         if input_image is not None:
             x = input_image.convert("RGBA").resize(
                 (IMAGE_SIZE, IMAGE_SIZE), resample=Image.NEAREST
             )
             x = transforms.ToTensor()(x).unsqueeze(0).to(device)
             x = x * 2 - 1
-            mu, logvar = model.encode(x, text_encoding)
-            z_img = model.reparameterize(mu, logvar)
-            z = img_control * z_img + (1.0 - img_control) * z
+            t_start = float(min(max(1.0 - img_control, 1e-3), 1.0))
+            noise = torch.randn_like(x) * temperature
+            x_start = (1.0 - t_start) * x + t_start * noise
 
-        generated_image = decode_with_cfg(model, z, text_encoding, cfg_scale=cfg_scale)
+        generated = sample_rectified_flow(
+            model,
+            pooled,
+            seq,
+            steps=steps,
+            cfg_scale=cfg_scale,
+            temperature=temperature,
+            sampler=sampler,
+            x_start=x_start,
+            t_start=t_start,
+            device=device,
+        )
 
-    generated_image = generated_image.squeeze(0).float().cpu()
-    generated_image = quantize_u8((generated_image + 1) / 2).clamp(0, 1)
-    return transforms.ToPILImage()(generated_image)
+    generated = generated.squeeze(0).float().cpu()
+    generated = quantize_u8((generated + 1) / 2).clamp(0, 1)
+    return transforms.ToPILImage()(generated)
 
 
 def _strip_compile_prefix(state):
@@ -79,14 +96,8 @@ def _strip_compile_prefix(state):
     return state
 
 
-def load_model(model_path, device, freeze_bert=True):
-    text_encoder = TextEncoder(
-        hidden_size=TEXT_DIM,
-        output_size=TEXT_DIM,
-        freeze_bert=freeze_bert,
-        unfreeze_last_n=0,
-    )
-    model = CVAE(text_encoder, latent_dim=LATENT_DIM, text_dim=TEXT_DIM).to(device)
+def load_model(model_path, device):
+    model = BitRoss(clip_id=CLIP_ID).to(device)
     try:
         raw = torch.load(model_path, map_location=device, weights_only=False)
     except TypeError:
@@ -107,7 +118,7 @@ def load_model(model_path, device, freeze_bert=True):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate an image from a text prompt using the trained CVAE model(s)."
+        description="Generate a 16x16 item sprite from a text prompt (rectified-flow DiT)."
     )
     parser.add_argument("--prompt", type=str, help="Text prompt for image generation")
     parser.add_argument(
@@ -140,19 +151,25 @@ def main():
         "--img_control",
         type=float,
         default=0.5,
-        help="Control how much the input image influences the output (0 to 1)",
+        help="How much the input image is preserved (0 = ignore, 1 = keep)",
     )
     parser.add_argument(
         "--cfg_scale",
         type=float,
-        default=2.0,
+        default=2.5,
         help="Classifier-free guidance scale (1 = off)",
     )
     parser.add_argument(
         "--temperature",
         type=float,
         default=1.0,
-        help="Latent noise temperature (<1 is more typical, >1 is more diverse)",
+        help="Initial noise scale (<1 typical, >1 diverse)",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=20,
+        help="Rectified-flow integration steps (Heun uses 2 NFE each except the last)",
     )
     args = parser.parse_args()
 
@@ -167,6 +184,7 @@ def main():
         parser.error("Provide --model_path or --model_paths")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer = get_tokenizer()
 
     is_folder_output = os.path.isdir(args.output) or not args.output.endswith(
         (".png", ".jpg", ".jpeg", ".webp")
@@ -198,6 +216,8 @@ def main():
                 args.img_control,
                 cfg_scale=args.cfg_scale,
                 temperature=args.temperature,
+                steps=args.steps,
+                tokenizer=tokenizer,
             )
             generation_time = time.time() - start_time
 

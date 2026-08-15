@@ -1,280 +1,376 @@
+"""BitRoss generative model (2023–2026 stack).
+
+The original CVAE is the wrong family for a quality retrain:
+VAEs blur discrete pixels (Pixel VQ-VAE, EXAG 2022; PixDiff-PIG 2026).
+16x16 RGBA is small enough to drop the autoencoder and generate in pixel space.
+
+This module is a CLIP-conditioned pixel DiT trained with rectified flow:
+- Flow Matching / Rectified Flow (Lipman et al. ICLR 2023; Liu et al. 2022)
+- DiT AdaLN-Zero (Peebles & Xie ICCV 2023) + PixArt-α cross-attention (Chen 2023)
+- CLIP text instead of BERT (vision-language space, not masked LM)
+- CoOp-style learnable prompt tokens (Zhou et al. 2022)
+- SD3 logit-normal timestep sampling (Esser et al. 2024)
+- Offset noise on RGB (Lin et al. 2023) so global tint is not stuck at 0
+"""
+
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 IMAGE_SIZE = 16
+CHANNELS = 4
+DIT_DIM = 384
+DIT_DEPTH = 10
+DIT_HEADS = 6
+TEXT_DIM = DIT_DIM
+CLIP_ID = "openai/clip-vit-base-patch32"
+CLIP_MAX_LEN = 77
+N_CTX = 4  # CoOp prefix tokens inserted after BOS
+OFFSET_NOISE = 0.1
+
+# Kept so older imports don't explode; unused by the flow model.
 LATENT_DIM = 256
-TEXT_DIM = 512
-HIDDEN_DIM = TEXT_DIM  # alias used by train/generate
-BASE_CH = 64
+HIDDEN_DIM = TEXT_DIM
 
 
-def group_norm(channels):
-    for groups in (8, 4, 2, 1):
-        if channels % groups == 0:
-            return nn.GroupNorm(groups, channels)
-    return nn.GroupNorm(1, channels)
+def tokenize_prompts(tokenizer, prompts, device=None):
+    """Tokenize for CLIP, leaving room for CoOp prefix tokens."""
+    encoded = tokenizer(
+        list(prompts),
+        padding="max_length",
+        truncation=True,
+        max_length=CLIP_MAX_LEN - N_CTX,
+        return_tensors="pt",
+    )
+    input_ids = encoded["input_ids"]
+    attention_mask = encoded["attention_mask"]
+    if device is not None:
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
+    return input_ids, attention_mask
 
 
-class FiLM(nn.Module):
-    """Feature-wise affine modulation from a text vector."""
+def logit_normal_t(batch, device, dtype=torch.float32):
+    """SD3 timestep distribution: sigmoid(N(0,1)), biased toward mid-t."""
+    u = torch.randn(batch, device=device, dtype=dtype)
+    return torch.sigmoid(u).clamp(1e-4, 1.0 - 1e-4)
 
-    def __init__(self, cond_dim, channels):
+
+def sinusoidal_embedding(t, dim, max_period=10000.0):
+    """t is in [0, 1]; scaled to 0–1000 so frequencies match diffusion practice."""
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(max_period)
+        * torch.arange(half, device=t.device, dtype=torch.float32)
+        / half
+    )
+    args = t.float()[:, None] * 1000.0 * freqs[None]
+    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2:
+        emb = F.pad(emb, (0, 1))
+    return emb.to(dtype=t.dtype if t.dtype.is_floating_point else torch.float32)
+
+
+def modulate(x, shift, scale):
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+def sincos_2d(h, w, dim, device="cpu"):
+    """ViT-style 2D sine-cosine positional embedding (DiT)."""
+    assert dim % 4 == 0
+    y, x = torch.meshgrid(
+        torch.arange(h, device=device), torch.arange(w, device=device), indexing="ij"
+    )
+    omega = torch.arange(dim // 4, device=device, dtype=torch.float32)
+    omega = 1.0 / (10000 ** (omega / (dim // 4)))
+    y = y.flatten()[:, None] * omega[None]
+    x = x.flatten()[:, None] * omega[None]
+    return torch.cat([x.sin(), x.cos(), y.sin(), y.cos()], dim=1)
+
+
+class CLIPTextEncoder(nn.Module):
+    """Frozen CLIP text tower + CoOp prefix + projection into DiT width."""
+
+    def __init__(self, clip_id=CLIP_ID, n_ctx=N_CTX, out_dim=TEXT_DIM):
         super().__init__()
-        self.to_scale_shift = nn.Linear(cond_dim, channels * 2)
+        from transformers import CLIPModel
+
+        # The Hub checkpoint is a full CLIPModel; take the text tower only.
+        full = CLIPModel.from_pretrained(clip_id)
+        self.clip = full.text_model
+        del full
+        self.clip.eval()
+        for p in self.clip.parameters():
+            p.requires_grad = False
+        clip_dim = self.clip.config.hidden_size
+        self.n_ctx = n_ctx
+        self.context = nn.Parameter(torch.randn(n_ctx, clip_dim) * 0.02)
+        self.proj_seq = nn.Linear(clip_dim, out_dim)
+        self.proj_pool = nn.Sequential(
+            nn.LayerNorm(clip_dim),
+            nn.Linear(clip_dim, out_dim),
+            nn.SiLU(),
+            nn.Linear(out_dim, out_dim),
+        )
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.clip.eval()
+        return self
+
+    def forward(self, input_ids, attention_mask):
+        text_model = self.clip
+        tok_embeds = text_model.embeddings.token_embedding(input_ids)
+        bsz = tok_embeds.size(0)
+        prefix = self.context.unsqueeze(0).expand(bsz, -1, -1)
+        # Keep BOS, splice learned context, then the remaining CLIP tokens.
+        embeds = torch.cat([tok_embeds[:, :1], prefix, tok_embeds[:, 1:]], dim=1)
+        prefix_mask = attention_mask.new_ones(bsz, self.n_ctx)
+        mask = torch.cat(
+            [attention_mask[:, :1], prefix_mask, attention_mask[:, 1:]], dim=1
+        )
+
+        hidden_states = text_model.embeddings(inputs_embeds=embeds)
+        from transformers.masking_utils import create_causal_mask
+
+        causal_mask = create_causal_mask(
+            config=text_model.config,
+            inputs_embeds=hidden_states,
+            attention_mask=mask,
+            past_key_values=None,
+        )
+        encoder_out = text_model.encoder(
+            inputs_embeds=hidden_states,
+            attention_mask=causal_mask,
+            is_causal=True,
+        )
+        hidden = text_model.final_layer_norm(encoder_out.last_hidden_state)
+
+        # CLIP EOS is the max token id; inserting prefix after BOS shifts it by n_ctx.
+        eos_pos = input_ids.argmax(dim=-1) + self.n_ctx
+        eos_pos = eos_pos.clamp(max=hidden.size(1) - 1)
+        pooled = hidden[torch.arange(bsz, device=hidden.device), eos_pos]
+        return self.proj_pool(pooled), self.proj_seq(hidden)
+
+
+class SelfAttention(nn.Module):
+    def __init__(self, dim, heads):
+        super().__init__()
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        b, n, c = x.shape
+        qkv = self.qkv(x).reshape(b, n, 3, self.heads, self.head_dim)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(1, 2).reshape(b, n, c)
+        return self.proj(out)
+
+
+class MLP(nn.Module):
+    def __init__(self, dim, ratio=4.0):
+        super().__init__()
+        hidden = int(dim * ratio)
+        self.fc1 = nn.Linear(dim, hidden)
+        self.fc2 = nn.Linear(hidden, dim)
+
+    def forward(self, x):
+        return self.fc2(F.gelu(self.fc1(x), approximate="tanh"))
+
+
+class DiTBlock(nn.Module):
+    """AdaLN-Zero self-attn + PixArt-style text cross-attn + MLP."""
+
+    def __init__(self, dim, heads):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.attn = SelfAttention(dim, heads)
+        self.norm_cross = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.cross_attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.mlp = MLP(dim)
+        self.adaLN = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+        nn.init.zeros_(self.adaLN[-1].weight)
+        nn.init.zeros_(self.adaLN[-1].bias)
+        nn.init.zeros_(self.cross_attn.out_proj.weight)
+        nn.init.zeros_(self.cross_attn.out_proj.bias)
+
+    def forward(self, x, cond, text):
+        shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = self.adaLN(cond).chunk(
+            6, dim=1
+        )
+        x = x + gate_a.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_a, scale_a))
+        x = x + self.cross_attn(self.norm_cross(x), text, text, need_weights=False)[0]
+        x = x + gate_m.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_m, scale_m))
+        return x
+
+
+class FinalLayer(nn.Module):
+    def __init__(self, dim, out_ch=CHANNELS):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.adaLN = nn.Sequential(nn.SiLU(), nn.Linear(dim, 2 * dim))
+        self.linear = nn.Linear(dim, out_ch)
+        nn.init.zeros_(self.adaLN[-1].weight)
+        nn.init.zeros_(self.adaLN[-1].bias)
+        nn.init.zeros_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
 
     def forward(self, x, cond):
-        scale, shift = self.to_scale_shift(cond).chunk(2, dim=1)
-        return x * (1.0 + scale[:, :, None, None]) + shift[:, :, None, None]
+        shift, scale = self.adaLN(cond).chunk(2, dim=1)
+        x = modulate(self.norm(x), shift, scale)
+        return self.linear(x)
 
 
-class ResBlock(nn.Module):
-    def __init__(self, channels, cond_dim):
-        super().__init__()
-        self.norm1 = group_norm(channels)
-        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.norm2 = group_norm(channels)
-        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.film1 = FiLM(cond_dim, channels)
-        self.film2 = FiLM(cond_dim, channels)
-        self.act = nn.SiLU()
-
-    def forward(self, x, cond):
-        h = self.act(self.norm1(x))
-        h = self.film1(h, cond)
-        h = self.conv1(h)
-        h = self.act(self.norm2(h))
-        h = self.film2(h, cond)
-        h = self.conv2(h)
-        return x + h
-
-
-class SelfAttention2d(nn.Module):
-    def __init__(self, channels, heads=4):
-        super().__init__()
-        self.norm = group_norm(channels)
-        self.attn = nn.MultiheadAttention(channels, heads, batch_first=True)
-
-    def forward(self, x):
-        b, c, h, w = x.shape
-        q = self.norm(x).flatten(2).transpose(1, 2)
-        out, _ = self.attn(q, q, q, need_weights=False)
-        return x + out.transpose(1, 2).reshape(b, c, h, w)
-
-
-class Downsample(nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, 3, stride=2, padding=1)
-
-    def forward(self, x):
-        return self.conv(x)
-
-
-class Upsample(nn.Module):
-    """Nearest-neighbor upsample + conv — avoids ConvTranspose checkerboard on sprites."""
-
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, 3, padding=1)
-
-    def forward(self, x):
-        x = F.interpolate(x, scale_factor=2, mode="nearest")
-        return self.conv(x)
-
-
-class TextEncoder(nn.Module):
-    """BERT with masked mean pooling and an MLP projection.
-
-    Fine-tunes the last transformer blocks by default so item-name language
-    can actually move the sprite prior, without paying for a full BERT update.
-    """
+class PixelDiT(nn.Module):
+    """Patch-size-1 DiT over 16x16 RGBA — 256 tokens, one per pixel."""
 
     def __init__(
         self,
-        hidden_size=TEXT_DIM,
-        output_size=TEXT_DIM,
-        freeze_bert=False,
-        unfreeze_last_n=4,
+        dim=DIT_DIM,
+        depth=DIT_DEPTH,
+        heads=DIT_HEADS,
+        image_size=IMAGE_SIZE,
+        channels=CHANNELS,
     ):
         super().__init__()
-        from transformers import BertModel
-
-        self.bert = BertModel.from_pretrained("bert-base-uncased")
-        bert_dim = self.bert.config.hidden_size
-        self.proj = nn.Sequential(
-            nn.LayerNorm(bert_dim),
-            nn.Linear(bert_dim, output_size * 2),
-            nn.GELU(),
-            nn.Linear(output_size * 2, output_size),
-            nn.LayerNorm(output_size),
+        self.image_size = image_size
+        self.channels = channels
+        self.dim = dim
+        self.patch = nn.Linear(channels, dim)
+        pos = sincos_2d(image_size, image_size, dim)
+        self.register_buffer("pos_embed", pos.unsqueeze(0), persistent=False)
+        self.t_embed = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim),
         )
+        self.blocks = nn.ModuleList([DiTBlock(dim, heads) for _ in range(depth)])
+        self.final = FinalLayer(dim, channels)
 
-        for param in self.bert.parameters():
-            param.requires_grad = False
+    def forward(self, x, t, pooled, text_seq):
+        b, c, h, w = x.shape
+        tokens = x.flatten(2).transpose(1, 2)
+        tokens = self.patch(tokens) + self.pos_embed
+        cond = self.t_embed(sinusoidal_embedding(t, self.dim).to(dtype=tokens.dtype))
+        cond = cond + pooled
+        for block in self.blocks:
+            tokens = block(tokens, cond, text_seq)
+        out = self.final(tokens, cond)
+        return out.transpose(1, 2).reshape(b, c, h, w)
 
-        if not freeze_bert and unfreeze_last_n > 0:
-            for layer in self.bert.encoder.layer[-unfreeze_last_n:]:
-                for param in layer.parameters():
-                    param.requires_grad = True
-            if getattr(self.bert, "pooler", None) is not None:
-                for param in self.bert.pooler.parameters():
-                    param.requires_grad = True
 
-        self._bert_trainable = any(p.requires_grad for p in self.bert.parameters())
+class BitRoss(nn.Module):
+    """CLIP text encoder + pixel DiT. Predicts rectified-flow velocity."""
 
-    def forward(self, input_ids, attention_mask):
-        if self._bert_trainable:
-            hidden = self.bert(
-                input_ids=input_ids, attention_mask=attention_mask
-            ).last_hidden_state
+    def __init__(self, clip_id=CLIP_ID):
+        super().__init__()
+        self.text_encoder = CLIPTextEncoder(clip_id=clip_id, n_ctx=N_CTX, out_dim=TEXT_DIM)
+        self.dit = PixelDiT()
+        self.null_pooled = nn.Parameter(torch.zeros(1, TEXT_DIM))
+        self.null_token = nn.Parameter(torch.zeros(1, 1, TEXT_DIM))
+
+    def encode_text(self, input_ids, attention_mask, drop_p=0.0):
+        pooled, seq = self.text_encoder(input_ids, attention_mask)
+        if self.training and drop_p > 0:
+            drop = torch.rand(pooled.size(0), device=pooled.device) < drop_p
+            pooled = torch.where(drop[:, None], self.null_pooled.expand_as(pooled), pooled)
+            seq = torch.where(drop[:, None, None], self.null_token.expand_as(seq), seq)
+        return pooled, seq
+
+    def velocity(self, x, t, pooled, text_seq):
+        return self.dit(x, t, pooled, text_seq)
+
+    def cfg_velocity(self, x, t, pooled, text_seq, cfg_scale=2.5):
+        v_c = self.velocity(x, t, pooled, text_seq)
+        if cfg_scale is None or cfg_scale == 1.0:
+            return v_c
+        b = x.size(0)
+        v_u = self.velocity(
+            x,
+            t,
+            self.null_pooled.expand(b, -1),
+            self.null_token.expand(b, text_seq.size(1), -1),
+        )
+        return v_u + cfg_scale * (v_c - v_u)
+
+    def forward(self, x, t, input_ids, attention_mask, drop_p=0.0):
+        pooled, seq = self.encode_text(input_ids, attention_mask, drop_p=drop_p)
+        return self.velocity(x, t, pooled, seq)
+
+
+@torch.no_grad()
+def sample_rectified_flow(
+    model,
+    pooled,
+    text_seq,
+    steps=20,
+    cfg_scale=2.5,
+    temperature=1.0,
+    sampler="heun",
+    x_start=None,
+    t_start=1.0,
+    device=None,
+):
+    """Integrate dx/dt = v from t=t_start (noise) to t=0 (data)."""
+    device = device or pooled.device
+    b = pooled.size(0)
+    if x_start is None:
+        x = torch.randn(b, CHANNELS, IMAGE_SIZE, IMAGE_SIZE, device=device) * temperature
+    else:
+        x = x_start
+
+    ts = torch.linspace(t_start, 0.0, steps + 1, device=device)
+    for i in range(steps):
+        t = ts[i].expand(b)
+        dt = ts[i + 1] - ts[i]
+        v = model.cfg_velocity(x, t, pooled, text_seq, cfg_scale=cfg_scale)
+        if sampler == "heun":
+            x_pred = x + v * dt
+            t_next = ts[i + 1].expand(b)
+            v_next = model.cfg_velocity(
+                x_pred, t_next, pooled, text_seq, cfg_scale=cfg_scale
+            )
+            x = x + 0.5 * dt * (v + v_next)
         else:
-            with torch.no_grad():
-                hidden = self.bert(
-                    input_ids=input_ids, attention_mask=attention_mask
-                ).last_hidden_state
-
-        mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
-        pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
-        return self.proj(pooled)
+            x = x + v * dt
+    return x.clamp(-1, 1)
 
 
-class PixelCVAE(nn.Module):
-    """16x16 RGBA CVAE with FiLM text conditioning at every residual block."""
-
-    def __init__(self, latent_dim=LATENT_DIM, text_dim=TEXT_DIM, base_ch=BASE_CH):
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.text_dim = text_dim
-        ch = base_ch
-        ch2, ch3 = ch * 2, ch * 4
-
-        self.null_embed = nn.Parameter(torch.zeros(1, text_dim))
-
-        self.conv_in = nn.Conv2d(4, ch, 3, padding=1)
-        self.enc_16 = nn.ModuleList([ResBlock(ch, text_dim), ResBlock(ch, text_dim)])
-        self.down_8 = Downsample(ch, ch2)
-        self.enc_8 = nn.ModuleList([ResBlock(ch2, text_dim), ResBlock(ch2, text_dim)])
-        self.down_4 = Downsample(ch2, ch3)
-        self.enc_4 = nn.ModuleList(
-            [ResBlock(ch3, text_dim), SelfAttention2d(ch3), ResBlock(ch3, text_dim)]
-        )
-
-        enc_flat = ch3 * 4 * 4
-        self.to_stats = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(enc_flat + text_dim, ch3),
-            nn.SiLU(),
-        )
-        self.fc_mu = nn.Linear(ch3, latent_dim)
-        self.fc_logvar = nn.Linear(ch3, latent_dim)
-
-        self.from_latent = nn.Linear(latent_dim + text_dim, enc_flat)
-        self.dec_4 = nn.ModuleList(
-            [ResBlock(ch3, text_dim), SelfAttention2d(ch3), ResBlock(ch3, text_dim)]
-        )
-        self.up_8 = Upsample(ch3, ch2)
-        self.dec_8 = nn.ModuleList([ResBlock(ch2, text_dim), ResBlock(ch2, text_dim)])
-        self.up_16 = Upsample(ch2, ch)
-        self.dec_16 = nn.ModuleList([ResBlock(ch, text_dim), ResBlock(ch, text_dim)])
-        self.out_norm = group_norm(ch)
-        self.out_conv = nn.Conv2d(ch, 4, 3, padding=1)
-
-        nn.init.zeros_(self.out_conv.weight)
-        nn.init.zeros_(self.out_conv.bias)
-
-    def drop_condition(self, cond, p):
-        if (not self.training) or p <= 0:
-            return cond
-        drop = torch.rand(cond.size(0), 1, device=cond.device) < p
-        return torch.where(drop, self.null_embed.expand_as(cond), cond)
-
-    def encode(self, x, cond):
-        h = self.conv_in(x)
-        for block in self.enc_16:
-            h = block(h, cond) if isinstance(block, ResBlock) else block(h)
-        h = self.down_8(h)
-        for block in self.enc_8:
-            h = block(h, cond) if isinstance(block, ResBlock) else block(h)
-        h = self.down_4(h)
-        for block in self.enc_4:
-            h = block(h, cond) if isinstance(block, ResBlock) else block(h)
-        stats = self.to_stats(torch.cat([h.flatten(1), cond], dim=1))
-        return self.fc_mu(stats), self.fc_logvar(stats)
-
-    def decode(self, z, cond):
-        h = self.from_latent(torch.cat([z, cond], dim=1))
-        h = h.view(z.size(0), -1, 4, 4)
-        for block in self.dec_4:
-            h = block(h, cond) if isinstance(block, ResBlock) else block(h)
-        h = self.up_8(h)
-        for block in self.dec_8:
-            h = block(h, cond) if isinstance(block, ResBlock) else block(h)
-        h = self.up_16(h)
-        for block in self.dec_16:
-            h = block(h, cond) if isinstance(block, ResBlock) else block(h)
-        h = F.silu(self.out_norm(h))
-        return torch.tanh(self.out_conv(h))
-
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar.clamp(max=10.0))
-        return mu + torch.randn_like(std) * std
-
-    def forward(self, x, cond, cfg_dropout=0.0):
-        cond = self.drop_condition(cond, cfg_dropout)
-        mu, logvar = self.encode(x, cond)
-        z = self.reparameterize(mu, logvar)
-        return self.decode(z, cond), mu, logvar
+def flow_matching_loss(model, x, input_ids, attention_mask, cfg_dropout=0.1, alpha_weight=1.5):
+    """OT-path rectified flow: x_t = (1-t) x + t ε, target v = ε - x."""
+    b = x.size(0)
+    t = logit_normal_t(b, x.device, dtype=x.dtype)
+    noise = torch.randn_like(x)
+    noise[:, :3] = noise[:, :3] + OFFSET_NOISE * torch.randn(
+        b, 3, 1, 1, device=x.device, dtype=x.dtype
+    )
+    t4 = t[:, None, None, None]
+    x_t = (1.0 - t4) * x + t4 * noise
+    v_target = noise - x
+    v_pred = model(x_t, t, input_ids, attention_mask, drop_p=cfg_dropout)
+    weights = torch.ones_like(x)
+    weights[:, 3:4] = alpha_weight
+    mse = (weights * (v_pred - v_target).pow(2)).mean()
+    return mse, t.detach().mean()
 
 
-class CVAE(nn.Module):
-    """Full BitRoss model: text encoder + pixel CVAE.
-
-    `forward` still takes a precomputed text vector so the training loop can
-    tokenize once and apply classifier-free guidance dropout on the VAE body.
-    """
-
-    def __init__(self, text_encoder, latent_dim=LATENT_DIM, text_dim=TEXT_DIM, base_ch=BASE_CH):
-        super().__init__()
-        self.text_encoder = text_encoder
-        self.vae = PixelCVAE(latent_dim=latent_dim, text_dim=text_dim, base_ch=base_ch)
-        self.latent_dim = latent_dim
-        self.text_dim = text_dim
-
-    def encode(self, x, cond):
-        return self.vae.encode(x, cond)
-
-    def decode(self, z, cond):
-        return self.vae.decode(z, cond)
-
-    def reparameterize(self, mu, logvar):
-        return self.vae.reparameterize(mu, logvar)
-
-    def forward(self, x, cond, cfg_dropout=0.0):
-        return self.vae(x, cond, cfg_dropout=cfg_dropout)
-
-
-def decode_with_cfg(model, z, cond, cfg_scale=2.0):
-    """Linear CFG in image space: uncond + scale * (cond - uncond)."""
-    vae = model.vae if isinstance(model, CVAE) else model
-    if cfg_scale is None or cfg_scale == 1.0:
-        return vae.decode(z, cond)
-    uncond = vae.null_embed.expand_as(cond)
-    img_c = vae.decode(z, cond)
-    img_u = vae.decode(z, uncond)
-    return img_u + cfg_scale * (img_c - img_u)
+# Backward-compatible names used by the previous CVAE training loop.
+TextEncoder = CLIPTextEncoder
+CVAE = BitRoss
 
 
 if __name__ == "__main__":
-    vae = PixelCVAE()
-    x = torch.randn(2, 4, IMAGE_SIZE, IMAGE_SIZE)
-    c = torch.randn(2, TEXT_DIM)
-    recon, mu, logvar = vae(x, c, cfg_dropout=0.5)
-    assert recon.shape == x.shape, recon.shape
-    assert mu.shape == (2, LATENT_DIM) and logvar.shape == (2, LATENT_DIM)
-    cfg = decode_with_cfg(vae, torch.randn(2, LATENT_DIM), c, cfg_scale=2.0)
-    assert cfg.shape == x.shape
-    print(
-        f"PixelCVAE ok  params={sum(p.numel() for p in vae.parameters()):,}  "
-        f"recon={tuple(recon.shape)}"
-    )
+    dit = PixelDiT()
+    x = torch.randn(2, CHANNELS, IMAGE_SIZE, IMAGE_SIZE)
+    t = torch.rand(2)
+    pooled = torch.randn(2, TEXT_DIM)
+    seq = torch.randn(2, 16, TEXT_DIM)
+    v = dit(x, t, pooled, seq)
+    assert v.shape == x.shape, v.shape
+    print(f"PixelDiT ok  params={sum(p.numel() for p in dit.parameters()):,}  v={tuple(v.shape)}")
