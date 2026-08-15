@@ -651,7 +651,12 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=0, help="0 is fastest for the packed RAM cache")
     p.add_argument("--resume", type=str, default=None, help="Checkpoint path, or 'auto' for latest in save_dir")
     p.add_argument("--save_interval", type=int, default=25)
-    p.add_argument("--sample_interval", type=int, default=10)
+    p.add_argument(
+        "--sample_interval",
+        type=int,
+        default=1,
+        help="Generate a preview PNG every N epochs (1 = after every epoch, including epoch 1)",
+    )
     p.add_argument("--cfg_scale", type=float, default=2.5)
     p.add_argument("--cfg_dropout", type=float, default=0.1)
     p.add_argument("--sample_steps", type=int, default=20)
@@ -1002,9 +1007,11 @@ def main():
 
         if SAVE_INTERVAL_IMAGE and epoch % SAVE_INTERVAL_IMAGE == 0:
             from generate import generate_image
+            from PIL import Image as PILImage
 
             output_image = f"{SAVE_DIR}output_epoch_{epoch}.png"
-            prompt = "pixel art minecraft item, diamond sword, blue crystal blade"
+            prompt = "pixel art minecraft item, diamond sword"
+            print(f"Sampling epoch {epoch}: {prompt!r} → {output_image}", flush=True)
             model.eval()
             ema.apply_to(model)
             try:
@@ -1017,12 +1024,22 @@ def main():
                     steps=SAMPLE_STEPS,
                 )
                 generated_image.save(output_image)
+                preview = generated_image.resize((256, 256), PILImage.NEAREST)
+                preview_path = f"{SAVE_DIR}preview_epoch_{epoch}.png"
+                preview.save(preview_path)
+                print(f"Wrote {output_image} and 256px {preview_path}", flush=True)
+                try:
+                    from IPython.display import display
+
+                    display(preview)
+                except Exception:
+                    pass
                 if not args.no_wandb:
                     prompts = [
                         prompt,
-                        "pixel art minecraft item, red apple food",
-                        "pixel art minecraft item, iron pickaxe tool",
-                        "pixel art minecraft item, potion bottle, glowing purple liquid",
+                        "pixel art minecraft item, red apple",
+                        "pixel art minecraft item, iron pickaxe",
+                        "pixel art minecraft item, potion bottle",
                     ][:n_vis]
                     input_ids, attention_mask = tokenize_prompts(tokenizer, prompts, device)
                     pooled, seq = model.encode_text(input_ids, attention_mask, drop_p=0.0)
@@ -1037,7 +1054,7 @@ def main():
                     log = {
                         "generated_image": wandb.Image(
                             output_image,
-                            caption=f"EMA cfg={CFG_SCALE} steps={SAMPLE_STEPS} epoch {epoch}",
+                            caption=f"{prompt}  EMA cfg={CFG_SCALE} steps={SAMPLE_STEPS} epoch {epoch}",
                         )
                     }
                     log.update(
@@ -1051,6 +1068,7 @@ def main():
                     wandb.log(log)
             finally:
                 ema.restore(model)
+                model.train()
 
         if SAVE_INTERVAL and epoch % SAVE_INTERVAL == 0:
             latest_path = f"{SAVE_DIR}{MODEL_NAME}_latest.pth"
