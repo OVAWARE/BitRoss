@@ -1,0 +1,10 @@
+datasets
+huggingface_hub
+torch>=2.1
+torchvision
+transformers==5.15.0
+wandb
+pillow
+numpy
+requests
+openai

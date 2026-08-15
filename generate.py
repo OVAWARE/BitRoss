@@ -6,11 +6,24 @@ import numpy as np
 import torch
 from PIL import Image
 from torchvision import transforms
-from transformers import BertTokenizer
+from transformers import CLIPTokenizer
 
-from model import CVAE, TextEncoder, HIDDEN_DIM, LATENT_DIM
+from model import (
+    CLIP_ID,
+    IMAGE_SIZE,
+    BitRoss,
+    sample_rectified_flow,
+    tokenize_prompts,
+)
 
-tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+_tokenizer = None
+
+
+def get_tokenizer():
+    global _tokenizer
+    if _tokenizer is None:
+        _tokenizer = CLIPTokenizer.from_pretrained(CLIP_ID)
+    return _tokenizer
 
 
 def clean_image(image, threshold=0.75):
@@ -25,48 +38,89 @@ def clean_image(image, threshold=0.75):
     return Image.fromarray(np_image)
 
 
-def generate_image(model, text_prompt, device, input_image=None, img_control=0.5):
-    encoded_input = tokenizer(
-        text_prompt, padding=True, truncation=True, max_length=64, return_tensors="pt"
-    )
-    input_ids = encoded_input["input_ids"].to(device)
-    attention_mask = encoded_input["attention_mask"].to(device)
+def quantize_u8(image_01):
+    """Snap decoder output onto the 8-bit grid pixel art actually lives on."""
+    return (image_01 * 255.0).round().clamp(0, 255) / 255.0
+
+
+def generate_image(
+    model,
+    text_prompt,
+    device,
+    input_image=None,
+    img_control=0.5,
+    cfg_scale=2.5,
+    temperature=1.0,
+    steps=20,
+    tokenizer=None,
+    sampler="heun",
+):
+    tokenizer = tokenizer or get_tokenizer()
+    input_ids, attention_mask = tokenize_prompts(tokenizer, [text_prompt], device)
 
     with torch.no_grad():
-        text_encoding = model.text_encoder(input_ids, attention_mask)
-        z = torch.randn(1, LATENT_DIM, device=device)
-        generated_image = model.decode(z, text_encoding)
+        pooled, seq = model.encode_text(input_ids, attention_mask, drop_p=0.0)
+        x_start = None
+        t_start = 1.0
+        if input_image is not None:
+            x = input_image.convert("RGBA").resize(
+                (IMAGE_SIZE, IMAGE_SIZE), resample=Image.NEAREST
+            )
+            x = transforms.ToTensor()(x).unsqueeze(0).to(device)
+            x = x * 2 - 1
+            t_start = float(min(max(1.0 - img_control, 1e-3), 1.0))
+            noise = torch.randn_like(x) * temperature
+            x_start = (1.0 - t_start) * x + t_start * noise
 
-    if input_image is not None:
-        input_image = input_image.convert("RGBA").resize((16, 16), resample=Image.NEAREST)
-        input_image = transforms.ToTensor()(input_image).unsqueeze(0).to(device)
-        # Match training normalization range [-1, 1]
-        input_image = input_image * 2 - 1
-        generated_image = img_control * input_image + (1 - img_control) * generated_image
+        generated = sample_rectified_flow(
+            model,
+            pooled,
+            seq,
+            steps=steps,
+            cfg_scale=cfg_scale,
+            temperature=temperature,
+            sampler=sampler,
+            x_start=x_start,
+            t_start=t_start,
+            device=device,
+        )
 
-    generated_image = generated_image.squeeze(0).cpu()
-    generated_image = (generated_image + 1) / 2
-    generated_image = generated_image.clamp(0, 1)
-    return transforms.ToPILImage()(generated_image)
+    generated = generated.squeeze(0).float().cpu()
+    generated = quantize_u8((generated + 1) / 2).clamp(0, 1)
+    return transforms.ToPILImage()(generated)
 
 
-def load_model(model_path, device, freeze_bert=True):
-    text_encoder = TextEncoder(
-        hidden_size=HIDDEN_DIM, output_size=HIDDEN_DIM, freeze_bert=freeze_bert
-    )
-    model = CVAE(text_encoder).to(device)
-    state = torch.load(model_path, map_location=device)
-    # Allow checkpoints saved under torch.compile (_orig_mod. prefix)
+def _strip_compile_prefix(state):
     if any(k.startswith("_orig_mod.") for k in state):
-        state = {k.replace("_orig_mod.", "", 1): v for k, v in state.items()}
-    model.load_state_dict(state)
+        return {k.replace("_orig_mod.", "", 1): v for k, v in state.items()}
+    return state
+
+
+def load_model(model_path, device):
+    model = BitRoss(clip_id=CLIP_ID).to(device)
+    try:
+        raw = torch.load(model_path, map_location=device, weights_only=False)
+    except TypeError:
+        raw = torch.load(model_path, map_location=device)
+    if isinstance(raw, dict) and ("ema" in raw or "model" in raw):
+        state = raw.get("ema") or raw["model"]
+    else:
+        state = raw
+    state = _strip_compile_prefix(state)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    missing = [k for k in missing if "text_encoder.clip." not in k]
+    unexpected = [k for k in unexpected if "text_encoder.clip." not in k]
+    if missing:
+        print(f"Warning: missing keys when loading {model_path}: {missing[:8]}...")
+    if unexpected:
+        print(f"Warning: unexpected keys when loading {model_path}: {unexpected[:8]}...")
     model.eval()
     return model
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate an image from a text prompt using the trained CVAE model(s)."
+        description="Generate a 16x16 item sprite from a text prompt (rectified-flow DiT)."
     )
     parser.add_argument("--prompt", type=str, help="Text prompt for image generation")
     parser.add_argument(
@@ -99,7 +153,25 @@ def main():
         "--img_control",
         type=float,
         default=0.5,
-        help="Control how much the input image influences the output (0 to 1)",
+        help="How much the input image is preserved (0 = ignore, 1 = keep)",
+    )
+    parser.add_argument(
+        "--cfg_scale",
+        type=float,
+        default=2.5,
+        help="Classifier-free guidance scale (1 = off)",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Initial noise scale (<1 typical, >1 diverse)",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=20,
+        help="Rectified-flow integration steps (Heun uses 2 NFE each except the last)",
     )
     args = parser.parse_args()
 
@@ -114,6 +186,7 @@ def main():
         parser.error("Provide --model_path or --model_paths")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer = get_tokenizer()
 
     is_folder_output = os.path.isdir(args.output) or not args.output.endswith(
         (".png", ".jpg", ".jpeg", ".webp")
@@ -138,7 +211,15 @@ def main():
         for i, prompt in enumerate(prompts):
             start_time = time.time()
             generated_image = generate_image(
-                model, prompt, device, input_image, args.img_control
+                model,
+                prompt,
+                device,
+                input_image,
+                args.img_control,
+                cfg_scale=args.cfg_scale,
+                temperature=args.temperature,
+                steps=args.steps,
+                tokenizer=tokenizer,
             )
             generation_time = time.time() - start_time
 
@@ -152,9 +233,9 @@ def main():
             if not is_folder_output:
                 output_file = args.output
             else:
-                safe_prompt = "".join(c if c.isalnum() or c in "-_" else "_" for c in prompt)[
-                    :80
-                ]
+                safe_prompt = "".join(
+                    c if c.isalnum() or c in "-_" else "_" for c in prompt
+                )[:80]
                 output_file = os.path.join(
                     args.output, f"{model_name}_{safe_prompt}_{i:03d}.png"
                 )
