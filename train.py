@@ -6,6 +6,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import numpy as np
 import torch
 import torch.optim as optim
@@ -49,8 +52,6 @@ from model import (
     sample_rectified_flow,
     tokenize_prompts,
 )
-
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
 def load_metadata(metadata_file):
@@ -253,6 +254,18 @@ def load_or_build_packed_dataset(processed_dir, tokenizer):
         if packed is None:
             raise SystemExit(f"Failed to build packed cache in {processed_dir}")
     images, captions = packed
+    from prepare_dataset import ALPHA_CUTOFF, ALPHA_HI, ALPHA_LO
+
+    opaque = (images[..., 3] > ALPHA_CUTOFF).mean(axis=(1, 2))
+    keep = (opaque > ALPHA_LO) & (opaque < ALPHA_HI)
+    dropped = int((~keep).sum())
+    if dropped:
+        print(
+            f"Dropping {dropped:,} specks/solids "
+            f"(opaque not in ({ALPHA_LO:.0%}, {ALPHA_HI:.0%}))"
+        )
+        images = images[keep]
+        captions = [c for c, k in zip(captions, keep.tolist()) if k]
     print(f"Packed sprites: {images.shape[0]:,}  {images.shape[1:]}  {images.nbytes / 1e6:.0f} MB")
     print(f"Tokenizing {len(captions):,} captions...")
     ids_parts, mask_parts = [], []
@@ -501,16 +514,59 @@ def find_latest_checkpoint(save_dir, model_name="BitRoss"):
 
 
 def auto_batch_size(requested: int, device: torch.device) -> int:
+    """CoOp-through-CLIP at 512 OOM'd a 22GB L4. CLIP is now no_grad; 128 is safe."""
     if requested and requested > 0:
         return requested
     if device.type != "cuda":
         return 32
     vram = torch.cuda.get_device_properties(0).total_memory
     if vram >= 20 * 1024**3:
-        return 512
+        return 128
     if vram >= 12 * 1024**3:
-        return 256
-    return 128
+        return 64
+    return 32
+
+
+def make_loader(dataset, batch_size, device, num_workers):
+    return DataLoader(
+        dataset,
+        batch_size=min(batch_size, len(dataset)),
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=num_workers > 0,
+        prefetch_factor=2 if num_workers > 0 else None,
+        drop_last=len(dataset) > batch_size,
+    )
+
+
+def fit_batch_size(model, dataset, batch_size, device, optimizer, scaler, use_amp, amp_dtype, num_workers):
+    """Halve batch size until one forward+backward fits."""
+    while batch_size >= 8:
+        loader = make_loader(dataset, batch_size, device, num_workers)
+        try:
+            data, input_ids, attention_mask = next(iter(loader))
+            data = data.to(device, non_blocking=True)
+            input_ids = input_ids.to(device, non_blocking=True)
+            attention_mask = attention_mask.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            amp_enabled = use_amp and device.type == "cuda"
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                loss, _ = flow_matching_loss(model, data, input_ids, attention_mask, cfg_dropout=0.1)
+            loss.backward()
+            optimizer.zero_grad(set_to_none=True)
+            del data, input_ids, attention_mask, loss
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            print(f"Batch size {batch_size} fits")
+            return batch_size, loader
+        except torch.cuda.OutOfMemoryError:
+            print(f"OOM at batch {batch_size}; retrying with {batch_size // 2}")
+            optimizer.zero_grad(set_to_none=True)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            batch_size //= 2
+    raise RuntimeError("CUDA OOM even at batch size 8")
 
 
 def make_scaler(enabled: bool):
@@ -541,7 +597,7 @@ def parse_args():
         "--batch_size",
         type=int,
         default=0,
-        help="0 = auto from GPU VRAM (512 on L4, 256 on T4, 128 otherwise)",
+        help="0 = auto from GPU VRAM (128 on L4, 64 on T4; shrinks on OOM)",
     )
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--num_workers", type=int, default=0, help="0 is fastest for the packed RAM cache")
@@ -698,6 +754,41 @@ def main():
         raise SystemExit("No training images found (check --processed_dir or --data_dir)")
     print(f"Dataset size: {len(dataset)}")
 
+    model = BitRoss(clip_id=CLIP_ID).to(device)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    print(
+        f"Trainable params: {sum(p.numel() for p in trainable):,} / "
+        f"{sum(p.numel() for p in model.parameters()):,}"
+    )
+    optimizer = optim.AdamW(trainable, lr=LEARNING_RATE, weight_decay=0.01, betas=(0.9, 0.99))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+    scaler = make_scaler(USE_AMP and device.type == "cuda" and not use_bf16)
+    ema = EMA(model, decay=EMA_DECAY)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    if args.compile and device.type == "cuda":
+        try:
+            model.dit = torch.compile(model.dit)
+            print("torch.compile enabled on PixelDiT")
+        except Exception as e:
+            print(f"torch.compile skipped: {e}")
+
+    if device.type == "cuda":
+        BATCH_SIZE, train_loader = fit_batch_size(
+            model,
+            dataset,
+            BATCH_SIZE,
+            device,
+            optimizer,
+            scaler,
+            USE_AMP,
+            amp_dtype,
+            num_workers,
+        )
+    else:
+        train_loader = make_loader(dataset, BATCH_SIZE, device, num_workers)
+
     run_config = {
         "arch": "pixel-dit-flow",
         "TEXT_DIM": TEXT_DIM,
@@ -716,35 +807,6 @@ def main():
     }
 
     _init_wandb(enabled=not args.no_wandb, project=PROJECT_NAME, config=run_config)
-
-    train_loader = DataLoader(
-        dataset,
-        batch_size=min(BATCH_SIZE, len(dataset)),
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=device.type == "cuda",
-        persistent_workers=num_workers > 0,
-        prefetch_factor=2 if num_workers > 0 else None,
-        drop_last=len(dataset) > BATCH_SIZE,
-    )
-
-    model = BitRoss(clip_id=CLIP_ID).to(device)
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    print(
-        f"Trainable params: {sum(p.numel() for p in trainable):,} / "
-        f"{sum(p.numel() for p in model.parameters()):,}"
-    )
-    optimizer = optim.AdamW(trainable, lr=LEARNING_RATE, weight_decay=0.01, betas=(0.9, 0.99))
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
-    scaler = make_scaler(USE_AMP and device.type == "cuda" and not use_bf16)
-    ema = EMA(model, decay=EMA_DECAY)
-
-    if args.compile and device.type == "cuda":
-        try:
-            model.dit = torch.compile(model.dit)
-            print("torch.compile enabled on PixelDiT")
-        except Exception as e:
-            print(f"torch.compile skipped: {e}")
 
     start_epoch = 1
     resume_path = args.resume

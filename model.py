@@ -30,43 +30,18 @@ CLIP_MAX_LEN = 77
 N_CTX = 4  # CoOp prefix tokens inserted after BOS
 OFFSET_NOISE = 0.1
 
-try:
-    from transformers.masking_utils import create_causal_mask as _hf_create_causal_mask
-except Exception:  # older transformers
-    _hf_create_causal_mask = None
-
-
-def _clip_causal_mask(text_model, hidden_states, attention_mask):
-    """Build CLIP's causal + padding mask across transformers 4.x/5.x."""
-    if _hf_create_causal_mask is not None:
-        return _hf_create_causal_mask(
-            config=text_model.config,
-            inputs_embeds=hidden_states,
-            attention_mask=attention_mask,
-            past_key_values=None,
-        )
-    # Fallback: additive mask (0 keep, large negative drop) with causal triangle.
-    b, n, _ = hidden_states.shape
-    causal = torch.ones(n, n, device=hidden_states.device, dtype=hidden_states.dtype)
-    causal = torch.triu(causal, diagonal=1) * -1e4
-    mask = causal.unsqueeze(0).unsqueeze(0).expand(b, 1, n, n).clone()
-    if attention_mask is not None:
-        pad = (1.0 - attention_mask.to(dtype=hidden_states.dtype)[:, None, None, :]) * -1e4
-        mask = mask + pad
-    return mask
-
 # Kept so older imports don't explode; unused by the flow model.
 LATENT_DIM = 256
 HIDDEN_DIM = TEXT_DIM
 
 
 def tokenize_prompts(tokenizer, prompts, device=None):
-    """Tokenize for CLIP, leaving room for CoOp prefix tokens."""
+    """Tokenize for CLIP (learned DiT prefix tokens are added after encoding)."""
     encoded = tokenizer(
         list(prompts),
         padding="max_length",
         truncation=True,
-        max_length=CLIP_MAX_LEN - N_CTX,
+        max_length=CLIP_MAX_LEN,
         return_tensors="pt",
     )
     input_ids = encoded["input_ids"]
@@ -116,22 +91,30 @@ def sincos_2d(h, w, dim, device="cpu"):
 
 
 class CLIPTextEncoder(nn.Module):
-    """Frozen CLIP text tower + CoOp prefix + projection into DiT width."""
+    """Frozen CLIP text tower + a short learned prefix in DiT space.
+
+    CLIP runs under no_grad so CoOp-in-CLIP cannot blow VRAM at large batch
+    (backprop through 12 CLIP layers at batch 512 OOM'd an L4). The prefix is
+    concatenated onto the projected sequence for DiT cross-attention instead.
+    """
 
     def __init__(self, clip_id=CLIP_ID, n_ctx=N_CTX, out_dim=TEXT_DIM):
         super().__init__()
-        from transformers import CLIPModel
+        from transformers import CLIPTextModel
+        from transformers.utils import logging as hf_logging
 
-        # The Hub checkpoint is a full CLIPModel; take the text tower only.
-        full = CLIPModel.from_pretrained(clip_id)
-        self.clip = full.text_model
-        del full
+        prev = hf_logging.get_verbosity()
+        hf_logging.set_verbosity_error()
+        try:
+            self.clip = CLIPTextModel.from_pretrained(clip_id)
+        finally:
+            hf_logging.set_verbosity(prev)
         self.clip.eval()
         for p in self.clip.parameters():
             p.requires_grad = False
         clip_dim = self.clip.config.hidden_size
         self.n_ctx = n_ctx
-        self.context = nn.Parameter(torch.randn(n_ctx, clip_dim) * 0.02)
+        self.context = nn.Parameter(torch.randn(n_ctx, out_dim) * 0.02)
         self.proj_seq = nn.Linear(clip_dim, out_dim)
         self.proj_pool = nn.Sequential(
             nn.LayerNorm(clip_dim),
@@ -146,37 +129,15 @@ class CLIPTextEncoder(nn.Module):
         return self
 
     def forward(self, input_ids, attention_mask):
-        text_model = self.clip
-        tok_embeds = text_model.embeddings.token_embedding(input_ids)
-        bsz = tok_embeds.size(0)
-        prefix = self.context.unsqueeze(0).expand(bsz, -1, -1)
-        # Keep BOS, splice learned context, then the remaining CLIP tokens.
-        embeds = torch.cat([tok_embeds[:, :1], prefix, tok_embeds[:, 1:]], dim=1)
-        prefix_mask = attention_mask.new_ones(bsz, self.n_ctx)
-        mask = torch.cat(
-            [attention_mask[:, :1], prefix_mask, attention_mask[:, 1:]], dim=1
-        )
-
-        hidden_states = text_model.embeddings(inputs_embeds=embeds)
-        causal_mask = _clip_causal_mask(text_model, hidden_states, mask)
-        encoder_kwargs = {"inputs_embeds": hidden_states, "attention_mask": causal_mask}
-        try:
-            encoder_out = text_model.encoder(**encoder_kwargs, is_causal=True)
-        except TypeError:
-            encoder_out = text_model.encoder(**encoder_kwargs)
-        hidden = text_model.final_layer_norm(encoder_out.last_hidden_state)
-
-        # Official CLIP pools at EOS; CoOp tokens inserted after BOS shift that index.
-        eos_id = getattr(text_model, "eos_token_id", None)
-        if eos_id is None:
-            eos_id = getattr(text_model.config, "eos_token_id", 49407)
-        if int(eos_id) == 2:
-            eos_pos = input_ids.to(dtype=torch.int).argmax(dim=-1) + self.n_ctx
-        else:
-            eos_pos = (input_ids == eos_id).to(dtype=torch.int).argmax(dim=-1) + self.n_ctx
-        eos_pos = eos_pos.clamp(max=hidden.size(1) - 1)
-        pooled = hidden[torch.arange(bsz, device=hidden.device), eos_pos]
-        return self.proj_pool(pooled), self.proj_seq(hidden)
+        with torch.no_grad():
+            out = self.clip(input_ids=input_ids, attention_mask=attention_mask)
+            hidden = out.last_hidden_state
+            pooled = out.pooler_output
+        pooled = self.proj_pool(pooled)
+        seq = self.proj_seq(hidden)
+        prefix = self.context.unsqueeze(0).expand(seq.size(0), -1, -1)
+        seq = torch.cat([prefix, seq], dim=1)
+        return pooled, seq
 
 
 class SelfAttention(nn.Module):

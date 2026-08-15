@@ -26,7 +26,7 @@ import numpy as np
 from PIL import Image
 
 HF_DATASET = "OVAWARE/16xModdedMinecraft"
-ALPHA_LO = 0.01  # drop if >= 99% fully transparent
+ALPHA_LO = 0.05  # drop specks: need >5% opaque (~13 of 256 pixels)
 ALPHA_HI = 0.99  # drop if >= 99% opaque
 ALPHA_CUTOFF = 8  # 0-255; treat below this as transparent
 IMAGE_SIZE = 16
@@ -267,10 +267,15 @@ def selftest() -> None:
     assert abs(opaque_fraction(empty) - 0.0) < 1e-6, opaque_fraction(empty)
     assert opaque_fraction(opaque) > 0.99, opaque_fraction(opaque)
     frac = opaque_fraction(item)
-    assert 0.01 < frac < 0.99, frac
+    assert 0.05 < frac < 0.99, frac
     assert not keep_sprite(empty)
     assert not keep_sprite(opaque)
     assert keep_sprite(item)
+    speck = Image.new("RGBA", (16, 16), (0, 0, 0, 0))
+    speck.putpixel((8, 8), (255, 0, 0, 255))
+    speck.putpixel((9, 8), (255, 0, 0, 255))
+    assert opaque_fraction(speck) < 0.05
+    assert not keep_sprite(speck)
     assert is_item_type("item") and is_item_type("Items") and not is_item_type("block")
     cap = caption_from_row("diamond_sword.png", "better-end", "someone")
     assert "diamond sword" in cap and "better end" not in cap, cap
