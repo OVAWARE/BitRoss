@@ -671,6 +671,10 @@ def _ensure_wandb_api_key() -> str:
 
 
 def _init_wandb(enabled: bool, project: str, config: dict):
+    try:
+        wandb.finish(quiet=True)
+    except Exception:
+        pass
     if not enabled:
         os.environ["WANDB_MODE"] = "disabled"
         return wandb.init(project=project, config=config, mode="disabled")
@@ -683,6 +687,7 @@ def _init_wandb(enabled: bool, project: str, config: dict):
         os.environ["WANDB_MODE"] = "disabled"
         return wandb.init(project=project, config=config, mode="disabled")
     try:
+        wandb.login(key=key, relogin=True)
         return wandb.init(project=project, config=config, mode="online")
     except BaseException as e:
         print(f"wandb.init failed ({type(e).__name__}: {e}); continuing without W&B")
