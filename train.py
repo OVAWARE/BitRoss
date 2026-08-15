@@ -34,15 +34,13 @@ def load_metadata(metadata_file):
 
 
 def item_prompt(item):
-    """CLIP-style caption: name + description + tags.
-
-    CLIP was trained on natural image-text pairs; wrapping the item as a
-    'pixel art minecraft item' phrase is a cheap alignment win over raw BERT
-    token dumps.
-    """
+    """CLIP-style caption: name + description + tags, or a precomputed caption."""
+    if item.get("caption"):
+        return str(item["caption"])
     name = Path(str(item.get("file_name", ""))).stem.replace("_", " ").replace("-", " ")
     desc = str(item.get("description") or "").strip()
     tags = str(item.get("tags") or "").strip()
+    mod = str(item.get("mod_slug") or "").replace("_", " ").replace("-", " ").strip()
     parts = ["pixel art minecraft item"]
     if name:
         parts.append(name)
@@ -50,7 +48,38 @@ def item_prompt(item):
         parts.append(desc)
     if tags:
         parts.append(tags)
+    if mod and mod.lower() not in name.lower():
+        parts.append(f"from {mod}")
     return ", ".join(parts)
+
+
+class ProcessedHFDataset(Dataset):
+    """Rows from prepare_dataset.py (HuggingFace save_to_disk cache)."""
+
+    def __init__(self, hf_dataset):
+        self.ds = hf_dataset
+        self.transform = transforms.Compose(
+            [
+                transforms.Resize((IMAGE_SIZE, IMAGE_SIZE), interpolation=Image.NEAREST),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5, 0.5), (0.5, 0.5, 0.5, 0.5)),
+            ]
+        )
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        row = self.ds[idx]
+        image = row["image"]
+        if not isinstance(image, Image.Image):
+            import io
+
+            if isinstance(image, dict) and image.get("bytes"):
+                image = Image.open(io.BytesIO(image["bytes"]))
+            else:
+                image = Image.new("RGBA", (IMAGE_SIZE, IMAGE_SIZE), (0, 0, 0, 0))
+        return self.transform(image.convert("RGBA")), item_prompt(row)
 
 
 class Text2ImageDataset(Dataset):
@@ -225,6 +254,12 @@ def find_latest_checkpoint(save_dir):
 def parse_args():
     p = argparse.ArgumentParser(description="Train BitRoss (CLIP pixel DiT + rectified flow)")
     p.add_argument("--data_dir", type=str, default="./training-items/")
+    p.add_argument(
+        "--processed_dir",
+        type=str,
+        default=None,
+        help="HuggingFace save_to_disk cache from prepare_dataset.py",
+    )
     p.add_argument("--metadata", type=str, default=None, help="Defaults to <data_dir>/metadata.json")
     p.add_argument("--save_dir", type=str, default="./models/BitRoss/")
     p.add_argument("--epochs", type=int, default=800)
@@ -308,9 +343,17 @@ def main():
         torch.backends.cudnn.allow_tf32 = False
         print(f"GPU: {torch.cuda.get_device_name(0)}  bf16={use_bf16}")
 
-    dataset = Text2ImageDataset(DATA_DIR, METADATA_FILE)
+    if args.processed_dir:
+        from datasets import load_from_disk
+
+        hf_ds = load_from_disk(args.processed_dir)
+        if hasattr(hf_ds, "keys") and "train" in list(hf_ds.keys()):
+            hf_ds = hf_ds["train"]
+        dataset = ProcessedHFDataset(hf_ds)
+    else:
+        dataset = Text2ImageDataset(DATA_DIR, METADATA_FILE)
     if len(dataset) == 0:
-        raise SystemExit(f"No training images found in {DATA_DIR} ({METADATA_FILE})")
+        raise SystemExit("No training images found (check --processed_dir or --data_dir)")
     print(f"Dataset size: {len(dataset)}")
 
     train_loader = DataLoader(

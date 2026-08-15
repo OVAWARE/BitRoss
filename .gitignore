@@ -4,3 +4,6 @@ error
 error.log
 modrinth.csv
 tests
+processed-items
+training-items
+models

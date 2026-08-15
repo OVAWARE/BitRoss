@@ -1,3 +1,5 @@
+datasets
+huggingface_hub
 torch>=2.1
 torchvision
 transformers

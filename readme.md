@@ -64,11 +64,19 @@ python train.py --data_dir ./training-items --save_dir ./models/BitRoss
 
 ### Colab Pro
 
-This Cursor environment has no GPU. Train on Colab instead:
+This Cursor environment has no GPU. Train on Colab:
 
 [Open BitRoss_train.ipynb in Colab](https://colab.research.google.com/github/OVAWARE/BitRoss/blob/cursor/hq-cvae-architecture-5a9f/BitRoss_train.ipynb)
 
-Set **Runtime → Change runtime type → L4** (T4 if L4 is unavailable; skip A100). Point it at a `training-items/` folder with `metadata.json`. Checkpoints save to Google Drive.
+1. **Runtime → Change runtime type → L4** (T4 fallback; skip A100)
+2. Accept terms on [OVAWARE/16xModdedMinecraft](https://huggingface.co/datasets/OVAWARE/16xModdedMinecraft) and add Colab secret `HF_TOKEN`
+3. Run the notebook. It downloads the Hub dump, keeps `type=item` sprites that are not ~empty and not ~fully opaque, captions from `file_name` + `mod_slug`, caches to Drive, then trains.
+
+```bash
+export HF_TOKEN=hf_...
+python prepare_dataset.py --out_dir ./processed-items
+python train.py --processed_dir ./processed-items --save_dir ./models/BitRoss
+```
 
 ## Demo
 
