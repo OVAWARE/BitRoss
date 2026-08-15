@@ -8,7 +8,14 @@ from PIL import Image
 from torchvision import transforms
 from transformers import BertTokenizer
 
-from model import CVAE, TextEncoder, HIDDEN_DIM, LATENT_DIM
+from model import (
+    CVAE,
+    IMAGE_SIZE,
+    LATENT_DIM,
+    TEXT_DIM,
+    TextEncoder,
+    decode_with_cfg,
+)
 
 tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 
@@ -25,41 +32,75 @@ def clean_image(image, threshold=0.75):
     return Image.fromarray(np_image)
 
 
-def generate_image(model, text_prompt, device, input_image=None, img_control=0.5):
+def quantize_u8(image_01):
+    """Snap decoder output onto the 8-bit grid pixel art actually lives on."""
+    return (image_01 * 255.0).round().clamp(0, 255) / 255.0
+
+
+def generate_image(
+    model,
+    text_prompt,
+    device,
+    input_image=None,
+    img_control=0.5,
+    cfg_scale=2.0,
+    temperature=1.0,
+):
     encoded_input = tokenizer(
-        text_prompt, padding=True, truncation=True, max_length=64, return_tensors="pt"
+        text_prompt, padding=True, truncation=True, max_length=80, return_tensors="pt"
     )
     input_ids = encoded_input["input_ids"].to(device)
     attention_mask = encoded_input["attention_mask"].to(device)
 
     with torch.no_grad():
         text_encoding = model.text_encoder(input_ids, attention_mask)
-        z = torch.randn(1, LATENT_DIM, device=device)
-        generated_image = model.decode(z, text_encoding)
+        z = torch.randn(1, LATENT_DIM, device=device) * temperature
 
-    if input_image is not None:
-        input_image = input_image.convert("RGBA").resize((16, 16), resample=Image.NEAREST)
-        input_image = transforms.ToTensor()(input_image).unsqueeze(0).to(device)
-        # Match training normalization range [-1, 1]
-        input_image = input_image * 2 - 1
-        generated_image = img_control * input_image + (1 - img_control) * generated_image
+        if input_image is not None:
+            x = input_image.convert("RGBA").resize(
+                (IMAGE_SIZE, IMAGE_SIZE), resample=Image.NEAREST
+            )
+            x = transforms.ToTensor()(x).unsqueeze(0).to(device)
+            x = x * 2 - 1
+            mu, logvar = model.encode(x, text_encoding)
+            z_img = model.reparameterize(mu, logvar)
+            z = img_control * z_img + (1.0 - img_control) * z
 
-    generated_image = generated_image.squeeze(0).cpu()
-    generated_image = (generated_image + 1) / 2
-    generated_image = generated_image.clamp(0, 1)
+        generated_image = decode_with_cfg(model, z, text_encoding, cfg_scale=cfg_scale)
+
+    generated_image = generated_image.squeeze(0).float().cpu()
+    generated_image = quantize_u8((generated_image + 1) / 2).clamp(0, 1)
     return transforms.ToPILImage()(generated_image)
+
+
+def _strip_compile_prefix(state):
+    if any(k.startswith("_orig_mod.") for k in state):
+        return {k.replace("_orig_mod.", "", 1): v for k, v in state.items()}
+    return state
 
 
 def load_model(model_path, device, freeze_bert=True):
     text_encoder = TextEncoder(
-        hidden_size=HIDDEN_DIM, output_size=HIDDEN_DIM, freeze_bert=freeze_bert
+        hidden_size=TEXT_DIM,
+        output_size=TEXT_DIM,
+        freeze_bert=freeze_bert,
+        unfreeze_last_n=0,
     )
-    model = CVAE(text_encoder).to(device)
-    state = torch.load(model_path, map_location=device)
-    # Allow checkpoints saved under torch.compile (_orig_mod. prefix)
-    if any(k.startswith("_orig_mod.") for k in state):
-        state = {k.replace("_orig_mod.", "", 1): v for k, v in state.items()}
-    model.load_state_dict(state)
+    model = CVAE(text_encoder, latent_dim=LATENT_DIM, text_dim=TEXT_DIM).to(device)
+    try:
+        raw = torch.load(model_path, map_location=device, weights_only=False)
+    except TypeError:
+        raw = torch.load(model_path, map_location=device)
+    if isinstance(raw, dict) and ("ema" in raw or "model" in raw):
+        state = raw.get("ema") or raw["model"]
+    else:
+        state = raw
+    state = _strip_compile_prefix(state)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print(f"Warning: missing keys when loading {model_path}: {missing[:8]}...")
+    if unexpected:
+        print(f"Warning: unexpected keys when loading {model_path}: {unexpected[:8]}...")
     model.eval()
     return model
 
@@ -101,6 +142,18 @@ def main():
         default=0.5,
         help="Control how much the input image influences the output (0 to 1)",
     )
+    parser.add_argument(
+        "--cfg_scale",
+        type=float,
+        default=2.0,
+        help="Classifier-free guidance scale (1 = off)",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Latent noise temperature (<1 is more typical, >1 is more diverse)",
+    )
     args = parser.parse_args()
 
     if not args.prompt and not args.prompt_file:
@@ -138,7 +191,13 @@ def main():
         for i, prompt in enumerate(prompts):
             start_time = time.time()
             generated_image = generate_image(
-                model, prompt, device, input_image, args.img_control
+                model,
+                prompt,
+                device,
+                input_image,
+                args.img_control,
+                cfg_scale=args.cfg_scale,
+                temperature=args.temperature,
             )
             generation_time = time.time() - start_time
 
@@ -152,9 +211,9 @@ def main():
             if not is_folder_output:
                 output_file = args.output
             else:
-                safe_prompt = "".join(c if c.isalnum() or c in "-_" else "_" for c in prompt)[
-                    :80
-                ]
+                safe_prompt = "".join(
+                    c if c.isalnum() or c in "-_" else "_" for c in prompt
+                )[:80]
                 output_file = os.path.join(
                     args.output, f"{model_name}_{safe_prompt}_{i:03d}.png"
                 )

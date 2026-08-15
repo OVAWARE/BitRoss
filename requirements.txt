@@ -1,0 +1,8 @@
+torch>=2.1
+torchvision
+transformers
+wandb
+pillow
+numpy
+requests
+openai
