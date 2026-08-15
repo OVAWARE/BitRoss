@@ -683,13 +683,6 @@ def parse_args():
     args = p.parse_args()
     if args.resume in ("", "none", "None"):
         args.resume = None
-    if args.epochs == 800:
-        print(
-            "EPOCHS=800 is the old Colab default (~days of L4). "
-            "Using 40 instead (~few hours on the quality subset). "
-            "Set the Train form to 80 or 120 if you want a longer run."
-        )
-        args.epochs = 40
     return args
 
 
