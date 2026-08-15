@@ -128,8 +128,11 @@ def prepare(
     hi: float = ALPHA_HI,
 ):
     from datasets import load_dataset
+    from huggingface_hub import login
 
     token = resolve_token(token)
+    if token:
+        login(token=token, add_to_git_credential=False)
     print(f"Loading {HF_DATASET} (gated — needs HF_TOKEN + accepted terms)...")
     ds = load_dataset(HF_DATASET, split="train", token=token)
     print(f"Raw rows: {len(ds):,}  features={list(ds.features)}")
@@ -138,12 +141,23 @@ def prepare(
         print(f"Capped to {len(ds):,} for this run")
 
     n_raw = len(ds)
+    # Type-only pass first so we never decode ~482k block textures.
+    ds = ds.filter(
+        lambda types: [is_item_type(t) for t in types],
+        batched=True,
+        batch_size=4096,
+        input_columns=["type"],
+        num_proc=num_proc,
+        desc="keep type=item",
+    )
+    n_items = len(ds)
+    print(f"Items: {n_items:,} / {n_raw:,}")
     ds = ds.filter(
         lambda batch: filter_batch(batch, lo=lo, hi=hi),
         batched=True,
         batch_size=512,
         num_proc=num_proc,
-        desc="filter items + mixed alpha",
+        desc="drop empty / fully-opaque items",
     )
     ds = ds.map(
         add_captions_batch,
@@ -161,6 +175,7 @@ def prepare(
     stats = {
         "source": HF_DATASET,
         "raw": n_raw,
+        "items": n_items,
         "kept": n_keep,
         "alpha_lo": lo,
         "alpha_hi": hi,

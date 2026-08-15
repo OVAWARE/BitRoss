@@ -69,7 +69,7 @@ This Cursor environment has no GPU. Train on Colab:
 [Open BitRoss_train.ipynb in Colab](https://colab.research.google.com/github/OVAWARE/BitRoss/blob/cursor/hq-cvae-architecture-5a9f/BitRoss_train.ipynb)
 
 1. **Runtime → Change runtime type → L4** (T4 fallback; skip A100)
-2. Accept terms on [OVAWARE/16xModdedMinecraft](https://huggingface.co/datasets/OVAWARE/16xModdedMinecraft) and add Colab secret `HF_TOKEN`
+2. Accept terms on [OVAWARE/16xModdedMinecraft](https://huggingface.co/datasets/OVAWARE/16xModdedMinecraft) and paste `HF_TOKEN` in the prepare cell (or add a Colab secret with that name). Do not commit the token.
 3. Run the notebook. It downloads the Hub dump, keeps `type=item` sprites that are not ~empty and not ~fully opaque, captions from `file_name` + `mod_slug`, caches to Drive, then trains.
 
 ```bash
