@@ -58,13 +58,17 @@ python generate.py [options]
 
 ### `train.py`
 
-This script is used for training models.
-
-**Usage:**
-
 ```bash
-python train.py
+python train.py --data_dir ./training-items --save_dir ./models/BitRoss
 ```
+
+### Colab Pro
+
+This Cursor environment has no GPU. Train on Colab instead:
+
+[Open BitRoss_train.ipynb in Colab](https://colab.research.google.com/github/OVAWARE/BitRoss/blob/cursor/hq-cvae-architecture-5a9f/BitRoss_train.ipynb)
+
+Set **Runtime → Change runtime type → L4** (T4 if L4 is unavailable; skip A100). Point it at a `training-items/` folder with `metadata.json`. Checkpoints save to Google Drive.
 
 ## Demo
 

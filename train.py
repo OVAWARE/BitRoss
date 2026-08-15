@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 from pathlib import Path
@@ -192,48 +193,86 @@ def train_one_epoch(
     return train_loss / max(n_samples, 1)
 
 
-def save_checkpoint(path, model, ema, epoch, config):
-    torch.save(
-        {
-            "model": unwrap_state_dict(model),
-            "ema": ema.state_dict() if ema is not None else unwrap_state_dict(model),
-            "epoch": epoch,
-            "config": config,
-            "arch": "pixel-dit-flow",
-        },
-        path,
-    )
+def save_checkpoint(path, model, ema, epoch, config, optimizer=None, scheduler=None):
+    payload = {
+        "model": unwrap_state_dict(model),
+        "ema": ema.state_dict() if ema is not None else unwrap_state_dict(model),
+        "epoch": epoch,
+        "config": config,
+        "arch": "pixel-dit-flow",
+    }
+    if optimizer is not None:
+        payload["optimizer"] = optimizer.state_dict()
+    if scheduler is not None:
+        payload["scheduler"] = scheduler.state_dict()
+    torch.save(payload, path)
 
 
 def tensor_to_pil(t):
     return transforms.ToPILImage()((t * 0.5 + 0.5).cpu().clamp(0, 1))
 
 
+def find_latest_checkpoint(save_dir):
+    save_dir = Path(save_dir)
+    if not save_dir.exists():
+        return None
+    ckpts = list(save_dir.glob("*_epoch_*.pth")) + list(save_dir.glob("*_final.pth"))
+    if not ckpts:
+        return None
+    return max(ckpts, key=lambda p: p.stat().st_mtime)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Train BitRoss (CLIP pixel DiT + rectified flow)")
+    p.add_argument("--data_dir", type=str, default="./training-items/")
+    p.add_argument("--metadata", type=str, default=None, help="Defaults to <data_dir>/metadata.json")
+    p.add_argument("--save_dir", type=str, default="./models/BitRoss/")
+    p.add_argument("--epochs", type=int, default=800)
+    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--num_workers", type=int, default=None)
+    p.add_argument("--resume", type=str, default=None, help="Checkpoint path, or 'auto' for latest in save_dir")
+    p.add_argument("--save_interval", type=int, default=25)
+    p.add_argument("--sample_interval", type=int, default=10)
+    p.add_argument("--cfg_scale", type=float, default=2.5)
+    p.add_argument("--cfg_dropout", type=float, default=0.1)
+    p.add_argument("--sample_steps", type=int, default=20)
+    p.add_argument("--project", type=str, default="BitRoss")
+    p.add_argument("--model_name", type=str, default="BitRoss")
+    p.add_argument("--no_wandb", action="store_true")
+    p.add_argument("--no_amp", action="store_true")
+    args = p.parse_args()
+    if args.resume in ("", "none", "None"):
+        args.resume = None
+    return args
+
+
 def main():
-    NUM_EPOCHS = 800
-    BATCH_SIZE = 128
-    LEARNING_RATE = 1e-4
-    CFG_DROPOUT = 0.1
-    CFG_SCALE = 2.5
-    SAMPLE_STEPS = 20
+    args = parse_args()
+    NUM_EPOCHS = args.epochs
+    BATCH_SIZE = args.batch_size
+    LEARNING_RATE = args.lr
+    CFG_DROPOUT = args.cfg_dropout
+    CFG_SCALE = args.cfg_scale
+    SAMPLE_STEPS = args.sample_steps
     EMA_DECAY = 0.999
     MAX_GRAD_NORM = 1.0
-    USE_AMP = True
+    USE_AMP = not args.no_amp
     LOG_EVERY = 50
-
-    SAVE_INTERVAL = 25
-    SAVE_INTERVAL_IMAGE = 10
-    PROJECT_NAME = "BitRoss"
-    MODEL_NAME = "BitRoss"
-    SAVE_DIR = "./models/BitRoss/"
+    SAVE_INTERVAL = args.save_interval
+    SAVE_INTERVAL_IMAGE = args.sample_interval
+    PROJECT_NAME = args.project
+    MODEL_NAME = args.model_name
+    SAVE_DIR = args.save_dir.rstrip("/") + "/"
+    DATA_DIR = args.data_dir
+    METADATA_FILE = args.metadata or os.path.join(DATA_DIR, "metadata.json")
 
     os.makedirs(SAVE_DIR, exist_ok=True)
 
-    num_workers = max(1, (os.cpu_count() or 2) // 2)
+    num_workers = args.num_workers
+    if num_workers is None:
+        num_workers = max(1, (os.cpu_count() or 2) // 2)
     tokenizer = CLIPTokenizer.from_pretrained(CLIP_ID)
-
-    DATA_DIR = "./training-items/"
-    METADATA_FILE = "./training-items/metadata.json"
 
     run_config = {
         "arch": "pixel-dit-flow",
@@ -252,19 +291,27 @@ def main():
         "num_workers": num_workers,
     }
 
-    wandb.init(project=PROJECT_NAME, config=run_config)
+    wandb.init(
+        project=PROJECT_NAME,
+        config=run_config,
+        mode="disabled" if args.no_wandb else "online",
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type != "cuda":
+        print("WARNING: no GPU detected — training will be extremely slow.")
     use_bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported()
     amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
+        print(f"GPU: {torch.cuda.get_device_name(0)}  bf16={use_bf16}")
 
     dataset = Text2ImageDataset(DATA_DIR, METADATA_FILE)
     if len(dataset) == 0:
         raise SystemExit(f"No training images found in {DATA_DIR} ({METADATA_FILE})")
+    print(f"Dataset size: {len(dataset)}")
 
     train_loader = DataLoader(
         dataset,
@@ -290,11 +337,39 @@ def main():
     )
     ema = EMA(model, decay=EMA_DECAY)
 
-    wandb.watch(model.dit, log="gradients", log_freq=100)
+    start_epoch = 1
+    resume_path = args.resume
+    if resume_path == "auto":
+        found = find_latest_checkpoint(SAVE_DIR)
+        resume_path = str(found) if found else None
+        if resume_path:
+            print(f"Auto-resume: {resume_path}")
+    if resume_path:
+        try:
+            ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        except TypeError:
+            ckpt = torch.load(resume_path, map_location=device)
+        state = ckpt.get("model", ckpt)
+        missing, unexpected = unwrap_module(model).load_state_dict(state, strict=False)
+        if missing:
+            print(f"Resume missing keys: {missing[:6]}")
+        if unexpected:
+            print(f"Resume unexpected keys: {unexpected[:6]}")
+        if ckpt.get("ema"):
+            ema.shadow = {k: v.to(device) for k, v in ckpt["ema"].items()}
+        if ckpt.get("optimizer"):
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if ckpt.get("scheduler"):
+            scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        print(f"Resumed from epoch {start_epoch - 1}")
+
+    if not args.no_wandb:
+        wandb.watch(model.dit, log="gradients", log_freq=100)
 
     n_vis = min(4, train_loader.batch_size or 4)
 
-    for epoch in range(1, NUM_EPOCHS + 1):
+    for epoch in range(start_epoch, NUM_EPOCHS + 1):
         train_loss = train_one_epoch(
             model,
             train_loader,
@@ -352,7 +427,9 @@ def main():
 
         if epoch % SAVE_INTERVAL == 0:
             model_save_path = f"{SAVE_DIR}{MODEL_NAME}_epoch_{epoch}.pth"
-            save_checkpoint(model_save_path, model, ema, epoch, run_config)
+            save_checkpoint(
+                model_save_path, model, ema, epoch, run_config, optimizer, scheduler
+            )
             print(f"Model saved to {model_save_path}")
 
         if epoch % 10 == 0:
@@ -386,7 +463,9 @@ def main():
         scheduler.step()
 
     final_path = f"{SAVE_DIR}{MODEL_NAME}_final.pth"
-    save_checkpoint(final_path, model, ema, NUM_EPOCHS, run_config)
+    save_checkpoint(
+        final_path, model, ema, NUM_EPOCHS, run_config, optimizer, scheduler
+    )
     print(f"Final EMA checkpoint saved to {final_path}")
     wandb.finish()
 
