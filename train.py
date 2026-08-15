@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
@@ -64,23 +65,12 @@ def load_metadata(metadata_file):
 
 
 def item_prompt(item):
-    """CLIP-style caption: name + description + tags, or a precomputed caption."""
+    """CLIP caption from the item name only (no mod slug)."""
+    from prepare_dataset import caption_from_row, strip_mod_clause
+
     if item.get("caption"):
-        return str(item["caption"])
-    name = Path(str(item.get("file_name", ""))).stem.replace("_", " ").replace("-", " ")
-    desc = str(item.get("description") or "").strip()
-    tags = str(item.get("tags") or "").strip()
-    mod = str(item.get("mod_slug") or "").replace("_", " ").replace("-", " ").strip()
-    parts = ["pixel art minecraft item"]
-    if name:
-        parts.append(name)
-    if desc and desc.lower() != name.lower():
-        parts.append(desc)
-    if tags:
-        parts.append(tags)
-    if mod and mod.lower() not in name.lower():
-        parts.append(f"from {mod}")
-    return ", ".join(parts)
+        return strip_mod_clause(str(item["caption"]))
+    return caption_from_row(item.get("file_name", ""))
 
 
 class ProcessedHFDataset(Dataset):
@@ -574,6 +564,66 @@ def parse_args():
     return args
 
 
+def _ensure_wandb_api_key() -> str:
+    """Find a W&B key in env, Colab secrets, or ~/.netrc (subprocess misses notebook login)."""
+    key = (os.environ.get("WANDB_API_KEY") or "").strip()
+    if key:
+        return key
+    try:
+        from google.colab import userdata
+
+        key = (userdata.get("WANDB_API_KEY") or "").strip()
+        if key:
+            os.environ["WANDB_API_KEY"] = key
+            return key
+    except Exception:
+        pass
+    try:
+        import netrc
+
+        auth = netrc.netrc().authenticators("api.wandb.ai")
+        if auth and len(auth) >= 3 and auth[2]:
+            os.environ["WANDB_API_KEY"] = auth[2]
+            return auth[2]
+    except Exception:
+        pass
+    return ""
+
+
+def _init_wandb(enabled: bool, project: str, config: dict):
+    if not enabled:
+        os.environ["WANDB_MODE"] = "disabled"
+        return wandb.init(project=project, config=config, mode="disabled")
+    key = _ensure_wandb_api_key()
+    if not key:
+        print(
+            "WANDB_API_KEY is not visible to train.py (Colab form field / secret / ~/.netrc). "
+            "Continuing without W&B rather than aborting."
+        )
+        os.environ["WANDB_MODE"] = "disabled"
+        return wandb.init(project=project, config=config, mode="disabled")
+    try:
+        return wandb.init(project=project, config=config, mode="online")
+    except BaseException as e:
+        print(f"wandb.init failed ({type(e).__name__}: {e}); continuing without W&B")
+        os.environ["WANDB_MODE"] = "disabled"
+        return wandb.init(project=project, config=config, mode="disabled")
+
+
+def _write_crash(text: str, save_dir: str | None = None) -> None:
+    paths = [Path("/tmp/bitross_train_crash.txt")]
+    if save_dir:
+        paths.append(Path(save_dir) / "train_crash.txt")
+    paths.append(Path("/content/drive/MyDrive/BitRoss/models/train_crash.txt"))
+    for path in paths:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+            print(f"Wrote crash log: {path}", flush=True)
+        except Exception:
+            pass
+
+
 def _git_sha() -> str:
     try:
         import subprocess
@@ -593,7 +643,7 @@ def _git_sha() -> str:
 
 def main():
     args = parse_args()
-    print(f"BitRoss train.py git={_git_sha()}  wandb={'off' if args.no_wandb else 'on'}")
+    print(f"BitRoss train.py git={_git_sha()}  wandb={'off' if args.no_wandb else 'on'}", flush=True)
     if args.selftest:
         return run_selftest()
 
@@ -665,11 +715,7 @@ def main():
         "num_workers": num_workers,
     }
 
-    wandb.init(
-        project=PROJECT_NAME,
-        config=run_config,
-        mode="disabled" if args.no_wandb else "online",
-    )
+    _init_wandb(enabled=not args.no_wandb, project=PROJECT_NAME, config=run_config)
 
     train_loader = DataLoader(
         dataset,
@@ -970,4 +1016,18 @@ def run_selftest():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+
+        tb = traceback.format_exc()
+        print(tb, flush=True)
+        save = None
+        try:
+            if "--save_dir" in sys.argv:
+                save = sys.argv[sys.argv.index("--save_dir") + 1]
+        except Exception:
+            save = None
+        _write_crash(tb, save)
+        raise

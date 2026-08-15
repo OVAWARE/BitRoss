@@ -72,15 +72,20 @@ def _pretty_name(file_name: str) -> str:
 
 
 def caption_from_row(file_name: str, mod_slug: str = "", author: str = "") -> str:
-    """Filename-derived caption — the Hub dump has no descriptions."""
+    """Filename-derived caption. Item name only — do not condition on the mod."""
+    del mod_slug, author
     parts = ["pixel art minecraft item"]
     name = _pretty_name(file_name)
     if name and name.lower() not in JUNK_NAMES and not name.isdigit():
         parts.append(name)
-    slug = _pretty_name(mod_slug)
-    if slug and slug.lower() not in name.lower():
-        parts.append(f"from {slug}")
     return ", ".join(parts)
+
+
+def strip_mod_clause(caption: str) -> str:
+    """Drop leftover 'from <mod>' clauses in already-packed captions."""
+    parts = [p.strip() for p in str(caption).split(",") if p.strip()]
+    kept = [p for p in parts if not p.lower().startswith("from ")]
+    return ", ".join(kept) if kept else "pixel art minecraft item"
 
 
 def resolve_token(explicit: str | None = None) -> str | None:
@@ -234,7 +239,7 @@ def load_packed_cache(out_dir):
     if not img_path.exists() or not cap_path.exists():
         return None
     images = np.load(img_path)
-    captions = json.loads(cap_path.read_text())
+    captions = [strip_mod_clause(c) for c in json.loads(cap_path.read_text())]
     if len(images) != len(captions):
         raise ValueError(f"Packed cache length mismatch: {len(images)} images vs {len(captions)} captions")
     return images, captions
@@ -273,9 +278,11 @@ def selftest() -> None:
     assert keep_sprite(item)
     assert is_item_type("item") and is_item_type("Items") and not is_item_type("block")
     cap = caption_from_row("diamond_sword.png", "better-end", "someone")
-    assert "diamond sword" in cap and "better end" in cap, cap
+    assert "diamond sword" in cap and "better end" not in cap, cap
     cap2 = caption_from_row("0.png", "coolmod")
-    assert "pixel art minecraft item" in cap2 and "coolmod" in cap2
+    assert "pixel art minecraft item" in cap2 and "coolmod" not in cap2, cap2
+    stripped = strip_mod_clause("pixel art minecraft item, axe, from overworld reforged")
+    assert stripped == "pixel art minecraft item, axe", stripped
     print("selftest ok", {"item_opaque_frac": frac, "caption": cap})
 
 
