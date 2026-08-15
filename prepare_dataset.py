@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -209,10 +210,20 @@ def write_packed_cache(ds, out_dir) -> None:
     tmp = out_path / (PACK_IMAGES + ".partial")
     with open(tmp, "wb") as f:
         np.save(f, images)
-    os.replace(tmp, out_path / PACK_IMAGES)
+    dest = out_path / PACK_IMAGES
+    try:
+        os.replace(tmp, dest)
+    except OSError:
+        shutil.copy2(tmp, dest)
+        tmp.unlink(missing_ok=True)
     cap_tmp = out_path / (PACK_CAPTIONS + ".partial")
     cap_tmp.write_text(json.dumps(captions))
-    os.replace(cap_tmp, out_path / PACK_CAPTIONS)
+    dest_cap = out_path / PACK_CAPTIONS
+    try:
+        os.replace(cap_tmp, dest_cap)
+    except OSError:
+        shutil.copy2(cap_tmp, dest_cap)
+        cap_tmp.unlink(missing_ok=True)
     print(f"Packed cache: {images.shape} {images.nbytes / 1e6:.0f} MB, {len(captions):,} captions")
 
 

@@ -187,6 +187,21 @@ def _cpu_state_dict(state):
     return {k: v.detach().cpu() if torch.is_tensor(v) else v for k, v in state.items()}
 
 
+def atomic_replace(src, dest):
+    """rename/replace, with copy+unlink for Google Drive FUSE (no os.replace)."""
+    src, dest = Path(src), Path(dest)
+    try:
+        os.replace(src, dest)
+        return
+    except OSError:
+        pass
+    shutil.copy2(src, dest)
+    try:
+        src.unlink()
+    except OSError:
+        pass
+
+
 def atomic_torch_save(obj, path):
     """Write to a sibling temp file then replace. Survives Drive/Colab kills mid-save."""
     path = Path(path)
@@ -195,10 +210,13 @@ def atomic_torch_save(obj, path):
     os.close(fd)
     try:
         torch.save(obj, tmp)
-        os.replace(tmp, path)
+        atomic_replace(tmp, path)
     except Exception:
         if os.path.exists(tmp):
-            os.remove(tmp)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
         raise
 
 
@@ -226,7 +244,12 @@ def load_or_build_packed_dataset(processed_dir, tokenizer):
         write_packed_cache,
     )
 
-    packed = load_packed_cache(processed_dir)
+    packed = None
+    try:
+        packed = load_packed_cache(processed_dir)
+    except Exception as e:
+        print(f"Packed cache unreadable ({e}); rebuilding")
+        packed = None
     if packed is None:
         from datasets import load_from_disk
 
@@ -549,45 +572,28 @@ def parse_args():
     if args.resume in ("", "none", "None"):
         args.resume = None
     return args
-    p.add_argument("--data_dir", type=str, default="./training-items/")
-    p.add_argument(
-        "--processed_dir",
-        type=str,
-        default=None,
-        help="HuggingFace save_to_disk cache from prepare_dataset.py",
-    )
-    p.add_argument("--metadata", type=str, default=None, help="Defaults to <data_dir>/metadata.json")
-    p.add_argument("--save_dir", type=str, default="./models/BitRoss/")
-    p.add_argument("--epochs", type=int, default=800)
-    p.add_argument(
-        "--batch_size",
-        type=int,
-        default=0,
-        help="0 = auto from GPU VRAM (512 on L4, 256 on T4, 128 otherwise)",
-    )
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--num_workers", type=int, default=0, help="0 is fastest for the packed RAM cache")
-    p.add_argument("--resume", type=str, default=None, help="Checkpoint path, or 'auto' for latest in save_dir")
-    p.add_argument("--save_interval", type=int, default=25)
-    p.add_argument("--sample_interval", type=int, default=10)
-    p.add_argument("--cfg_scale", type=float, default=2.5)
-    p.add_argument("--cfg_dropout", type=float, default=0.1)
-    p.add_argument("--sample_steps", type=int, default=20)
-    p.add_argument("--project", type=str, default="BitRoss")
-    p.add_argument("--model_name", type=str, default="BitRoss")
-    p.add_argument("--keep_checkpoints", type=int, default=2, help="Epoch .pth files to keep on disk; 0 keeps all")
-    p.add_argument("--no_wandb", action="store_true")
-    p.add_argument("--no_amp", action="store_true")
-    p.add_argument("--compile", action="store_true", help="torch.compile the DiT (optional extra speed)")
-    p.add_argument("--selftest", action="store_true", help="Save/resume/packed-cache smoke test, then exit")
-    args = p.parse_args()
-    if args.resume in ("", "none", "None"):
-        args.resume = None
-    return args
+
+
+def _git_sha() -> str:
+    try:
+        import subprocess
+
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=str(Path(__file__).resolve().parent),
+                stderr=subprocess.DEVNULL,
+            )
+            .decode()
+            .strip()
+        )
+    except Exception:
+        return "unknown"
 
 
 def main():
     args = parse_args()
+    print(f"BitRoss train.py git={_git_sha()}  wandb={'off' if args.no_wandb else 'on'}")
     if args.selftest:
         return run_selftest()
 
@@ -703,43 +709,51 @@ def main():
             print(f"Auto-resume: {resume_path}")
     if resume_path:
         try:
-            ckpt = torch.load(resume_path, map_location=device, weights_only=False)
-        except TypeError:
-            ckpt = torch.load(resume_path, map_location=device)
-        state = ckpt.get("model", ckpt)
-        missing, unexpected = unwrap_module(model).load_state_dict(state, strict=False)
-        missing = [k for k in missing if not _is_frozen_clip_key(k)]
-        unexpected = [k for k in unexpected if not _is_frozen_clip_key(k)]
-        if missing:
-            print(f"Resume missing keys: {missing[:6]}")
-        if unexpected:
-            print(f"Resume unexpected keys: {unexpected[:6]}")
-        if ckpt.get("ema"):
-            loaded_ema = ckpt["ema"]
-            model_keys = {k for k in unwrap_state_dict(model) if not _is_frozen_clip_key(k)}
-            ema_keys = {k for k in loaded_ema if not _is_frozen_clip_key(k)}
-            if ema_keys == model_keys:
-                ema.shadow = {k: v.to(device) for k, v in loaded_ema.items() if k in model_keys}
-            else:
-                print("EMA key mismatch — resetting EMA from current weights")
-                ema = EMA(model, decay=EMA_DECAY)
-        if ckpt.get("optimizer"):
             try:
-                optimizer.load_state_dict(ckpt["optimizer"])
-            except Exception as e:
-                print(f"Optimizer state not restored ({e}); continuing with fresh AdamW")
-        if ckpt.get("scheduler"):
-            try:
-                scheduler.load_state_dict(ckpt["scheduler"])
-            except Exception as e:
-                print(f"Scheduler state not restored ({e})")
-        if ckpt.get("scaler") and scaler is not None:
-            try:
-                scaler.load_state_dict(ckpt["scaler"])
-            except Exception as e:
-                print(f"GradScaler state not restored ({e})")
-        start_epoch = int(ckpt.get("epoch", 0)) + 1
-        print(f"Resumed from epoch {start_epoch - 1}")
+                ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+            except TypeError:
+                ckpt = torch.load(resume_path, map_location=device)
+            if not isinstance(ckpt, dict):
+                raise TypeError(f"{resume_path} is {type(ckpt).__name__}, not a checkpoint dict")
+            state = ckpt.get("model", ckpt)
+            if not isinstance(state, dict):
+                raise TypeError("checkpoint 'model' is not a state_dict")
+            missing, unexpected = unwrap_module(model).load_state_dict(state, strict=False)
+            missing = [k for k in missing if not _is_frozen_clip_key(k)]
+            unexpected = [k for k in unexpected if not _is_frozen_clip_key(k)]
+            if missing:
+                print(f"Resume missing keys: {missing[:6]}")
+            if unexpected:
+                print(f"Resume unexpected keys: {unexpected[:6]}")
+            if ckpt.get("ema"):
+                loaded_ema = ckpt["ema"]
+                model_keys = {k for k in unwrap_state_dict(model) if not _is_frozen_clip_key(k)}
+                ema_keys = {k for k in loaded_ema if not _is_frozen_clip_key(k)}
+                if ema_keys == model_keys:
+                    ema.shadow = {k: v.to(device) for k, v in loaded_ema.items() if k in model_keys}
+                else:
+                    print("EMA key mismatch — resetting EMA from current weights")
+                    ema = EMA(model, decay=EMA_DECAY)
+            if ckpt.get("optimizer"):
+                try:
+                    optimizer.load_state_dict(ckpt["optimizer"])
+                except Exception as e:
+                    print(f"Optimizer state not restored ({e}); continuing with fresh AdamW")
+            if ckpt.get("scheduler"):
+                try:
+                    scheduler.load_state_dict(ckpt["scheduler"])
+                except Exception as e:
+                    print(f"Scheduler state not restored ({e})")
+            if ckpt.get("scaler") and scaler is not None:
+                try:
+                    scaler.load_state_dict(ckpt["scaler"])
+                except Exception as e:
+                    print(f"GradScaler state not restored ({e})")
+            start_epoch = int(ckpt.get("epoch", 0)) + 1
+            print(f"Resumed from epoch {start_epoch - 1}")
+        except Exception as e:
+            print(f"Resume failed ({resume_path}): {e}\nStarting from epoch 1.")
+            start_epoch = 1
 
     if start_epoch > NUM_EPOCHS:
         print(
