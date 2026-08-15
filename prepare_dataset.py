@@ -6,8 +6,9 @@ The Hub dataset is gated parquet (~1.03M rows, 16x16 RGBA). Columns:
     project_type, version_url
 
 There are no text captions. `type` is `item` or `block`. We keep items whose
-alpha is mixed (drop ~empty and ~fully-opaque tiles) and build CLIP captions
-from the item filename only (`diamond_sword.png` → `pixel art minecraft item, diamond sword`).
+alpha is mixed: drop specks that are ≥95% transparent (fewer than ~13 of 256
+pixels opaque) and drop ≥99% opaque tiles. Captions come from the item
+filename only (`diamond_sword.png` → `pixel art minecraft item, diamond sword`).
 Mod slugs are never in the prompt.
 
 Processed output is a Hugging Face save_to_disk cache (not 500k tiny PNGs).
@@ -26,8 +27,8 @@ import numpy as np
 from PIL import Image
 
 HF_DATASET = "OVAWARE/16xModdedMinecraft"
-ALPHA_LO = 0.05  # drop specks: need >5% opaque (~13 of 256 pixels)
-ALPHA_HI = 0.99  # drop if >= 99% opaque
+ALPHA_LO = 0.05  # drop specks: keep only if >5% opaque (~13 of 256 px); ~95% transparent cutoff
+ALPHA_HI = 0.99  # drop near-solid tiles (>=99% opaque)
 ALPHA_CUTOFF = 8  # 0-255; treat below this as transparent
 IMAGE_SIZE = 16
 PACK_IMAGES = "images_u8.npy"

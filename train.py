@@ -514,7 +514,7 @@ def find_latest_checkpoint(save_dir, model_name="BitRoss"):
 
 
 def auto_batch_size(requested: int, device: torch.device) -> int:
-    """CoOp-through-CLIP at 512 OOM'd a 22GB L4. CLIP is now no_grad; 128 is safe."""
+    """L4 22GB OOM'd at 512 when grads went through CLIP. Frozen CLIP + checkpointed DiT fits 128."""
     if requested and requested > 0:
         return requested
     if device.type != "cuda":
@@ -541,7 +541,9 @@ def make_loader(dataset, batch_size, device, num_workers):
 
 
 def fit_batch_size(model, dataset, batch_size, device, optimizer, scaler, use_amp, amp_dtype, num_workers):
-    """Halve batch size until one forward+backward fits."""
+    """Halve batch size until one full Adam step fits (not just the forward)."""
+    scaler_enabled = bool(scaler is not None and scaler.is_enabled())
+    amp_enabled = use_amp and device.type == "cuda"
     while batch_size >= 8:
         loader = make_loader(dataset, batch_size, device, num_workers)
         try:
@@ -550,12 +552,22 @@ def fit_batch_size(model, dataset, batch_size, device, optimizer, scaler, use_am
             input_ids = input_ids.to(device, non_blocking=True)
             attention_mask = attention_mask.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            amp_enabled = use_amp and device.type == "cuda"
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                 loss, _ = flow_matching_loss(model, data, input_ids, attention_mask, cfg_dropout=0.1)
-            loss.backward()
+            backup = [p.detach().clone() for p in optimizer.param_groups[0]["params"]]
+            if scaler_enabled:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+            for p, b in zip(optimizer.param_groups[0]["params"], backup):
+                p.data.copy_(b)
             optimizer.zero_grad(set_to_none=True)
-            del data, input_ids, attention_mask, loss
+            optimizer.state.clear()
+            del data, input_ids, attention_mask, loss, backup
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             print(f"Batch size {batch_size} fits")
@@ -755,11 +767,27 @@ def main():
     print(f"Dataset size: {len(dataset)}")
 
     model = BitRoss(clip_id=CLIP_ID).to(device)
+    if device.type == "cuda":
+        model.text_encoder.to_inference_dtype(amp_dtype)
+    clip_trainable = sum(
+        p.numel() for p in model.text_encoder.clip.parameters() if p.requires_grad
+    )
+    if clip_trainable:
+        raise SystemExit(
+            f"CLIP has {clip_trainable:,} trainable params — that OOM'd the L4. "
+            "Re-run the Train cell so git reset picks up the frozen-CLIP build."
+        )
     trainable = [p for p in model.parameters() if p.requires_grad]
     print(
         f"Trainable params: {sum(p.numel() for p in trainable):,} / "
-        f"{sum(p.numel() for p in model.parameters()):,}"
+        f"{sum(p.numel() for p in model.parameters()):,}  "
+        f"(CLIP frozen, dit checkpoint={model.dit.grad_checkpoint})"
     )
+    if device.type == "cuda":
+        print(
+            f"VRAM after load: {torch.cuda.memory_allocated() / 1024**3:.2f} GB "
+            f"reserved {torch.cuda.memory_reserved() / 1024**3:.2f} GB"
+        )
     optimizer = optim.AdamW(trainable, lr=LEARNING_RATE, weight_decay=0.01, betas=(0.9, 0.99))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
     scaler = make_scaler(USE_AMP and device.type == "cuda" and not use_bf16)
@@ -872,7 +900,8 @@ def main():
         return
 
     if not args.no_wandb:
-        wandb.watch(unwrap_module(model.dit), log="gradients", log_freq=100)
+        # log="gradients" keeps extra autograd hooks that cost VRAM on the L4.
+        wandb.watch(unwrap_module(model.dit), log=None, log_freq=200)
 
     n_vis = min(4, train_loader.batch_size or 4)
 
@@ -1047,6 +1076,7 @@ def run_selftest():
 
         device = torch.device("cpu")
         model = BitRoss(clip_id=CLIP_ID).to(device)
+        assert not any(p.requires_grad for p in model.text_encoder.clip.parameters())
         ema = EMA(model, decay=0.9)
         opt = optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=3)

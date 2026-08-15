@@ -110,8 +110,7 @@ class CLIPTextEncoder(nn.Module):
         finally:
             hf_logging.set_verbosity(prev)
         self.clip.eval()
-        for p in self.clip.parameters():
-            p.requires_grad = False
+        self.clip.requires_grad_(False)
         clip_dim = self.clip.config.hidden_size
         self.n_ctx = n_ctx
         self.context = nn.Parameter(torch.randn(n_ctx, out_dim) * 0.02)
@@ -128,11 +127,21 @@ class CLIPTextEncoder(nn.Module):
         self.clip.eval()
         return self
 
+    def to_inference_dtype(self, dtype):
+        """Keep frozen CLIP in fp16/bf16 so it does not occupy fp32 VRAM."""
+        if dtype in (torch.float16, torch.bfloat16):
+            self.clip.to(dtype=dtype)
+        return self
+
     def forward(self, input_ids, attention_mask):
         with torch.no_grad():
             out = self.clip(input_ids=input_ids, attention_mask=attention_mask)
             hidden = out.last_hidden_state
             pooled = out.pooler_output
+        # Cast off the frozen tower so trainable projections stay in model dtype.
+        proj_dtype = self.proj_seq.weight.dtype
+        hidden = hidden.to(dtype=proj_dtype)
+        pooled = pooled.to(dtype=proj_dtype)
         pooled = self.proj_pool(pooled)
         seq = self.proj_seq(hidden)
         prefix = self.context.unsqueeze(0).expand(seq.size(0), -1, -1)
@@ -237,6 +246,7 @@ class PixelDiT(nn.Module):
         )
         self.blocks = nn.ModuleList([DiTBlock(dim, heads) for _ in range(depth)])
         self.final = FinalLayer(dim, channels)
+        self.grad_checkpoint = True
 
     def forward(self, x, t, pooled, text_seq):
         b, c, h, w = x.shape
@@ -244,8 +254,14 @@ class PixelDiT(nn.Module):
         tokens = self.patch(tokens) + self.pos_embed
         cond = self.t_embed(sinusoidal_embedding(t, self.dim).to(dtype=tokens.dtype))
         cond = cond + pooled
+        use_ckpt = self.training and self.grad_checkpoint and tokens.requires_grad
         for block in self.blocks:
-            tokens = block(tokens, cond, text_seq)
+            if use_ckpt:
+                tokens = torch.utils.checkpoint.checkpoint(
+                    block, tokens, cond, text_seq, use_reentrant=False
+                )
+            else:
+                tokens = block(tokens, cond, text_seq)
         out = self.final(tokens, cond)
         return out.transpose(1, 2).reshape(b, c, h, w)
 
