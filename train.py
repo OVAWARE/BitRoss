@@ -150,7 +150,7 @@ def localize_processed_dir(processed_dir: str, local_root: str | None = None) ->
     root = Path(local_root or os.environ.get("BITROSS_LOCAL_DATA", "/content"))
     dest = root / "BitRoss-data" / src.name
     dest.mkdir(parents=True, exist_ok=True)
-    from prepare_dataset import PACK_CAPTIONS, PACK_IMAGES
+    from prepare_dataset import PACK_CAPTIONS, PACK_IMAGES, rewrite_packed_captions
 
     names = [PACK_IMAGES, PACK_CAPTIONS, "prepare_stats.json"]
     src_stats = src / "prepare_stats.json"
@@ -171,6 +171,9 @@ def localize_processed_dir(processed_dir: str, local_root: str | None = None) ->
             shutil.copytree(src, dest, dirs_exist_ok=True)
     else:
         print(f"Using local dataset copy: {dest}")
+    rewrite_packed_captions(dest)
+    if src != dest:
+        rewrite_packed_captions(src)
     return str(dest)
 
 
@@ -254,7 +257,7 @@ def load_or_build_packed_dataset(processed_dir, tokenizer):
         if packed is None:
             raise SystemExit(f"Failed to build packed cache in {processed_dir}")
     images, captions = packed
-    from prepare_dataset import ALPHA_CUTOFF, ALPHA_HI, ALPHA_LO
+    from prepare_dataset import ALPHA_CUTOFF, ALPHA_HI, ALPHA_LO, caption_has_mod_clause
 
     opaque = (images[..., 3] > ALPHA_CUTOFF).mean(axis=(1, 2))
     keep = (opaque > ALPHA_LO) & (opaque < ALPHA_HI)
@@ -267,6 +270,15 @@ def load_or_build_packed_dataset(processed_dir, tokenizer):
         images = images[keep]
         captions = [c for c, k in zip(captions, keep.tolist()) if k]
     print(f"Packed sprites: {images.shape[0]:,}  {images.shape[1:]}  {images.nbytes / 1e6:.0f} MB")
+    leftover = [c for c in captions if caption_has_mod_clause(c)]
+    if leftover:
+        raise SystemExit(
+            f"{len(leftover):,} captions still contain 'from <mod>' after strip "
+            f"(e.g. {leftover[0]!r}). Re-run Train so git reset picks up caption sanitizing."
+        )
+    print("Caption samples (item name only, no mod):")
+    for c in captions[:8]:
+        print(f"  {c}")
     print(f"Tokenizing {len(captions):,} captions...")
     ids_parts, mask_parts = [], []
     chunk = 4096

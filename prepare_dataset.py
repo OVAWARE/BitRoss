@@ -83,11 +83,34 @@ def caption_from_row(file_name: str, mod_slug: str = "", author: str = "") -> st
     return ", ".join(parts)
 
 
+_FROM_PART = re.compile(r"^from\s+\S", re.I)
+_FROM_TAIL = re.compile(r",\s*from\s+.+$", re.I)
+
+
 def strip_mod_clause(caption: str) -> str:
-    """Drop leftover 'from <mod>' clauses in already-packed captions."""
-    parts = [p.strip() for p in str(caption).split(",") if p.strip()]
-    kept = [p for p in parts if not p.lower().startswith("from ")]
+    """Drop leftover 'from <mod>' clauses in already-packed captions.
+
+    The first prepare wrote `pixel art minecraft item, helmet, from overworld
+    reforged`. Training must never see that mod clause.
+    """
+    text = _FROM_TAIL.sub("", str(caption).strip())
+    parts = [p.strip() for p in text.split(",") if p.strip()]
+    kept = [p for p in parts if not _FROM_PART.match(p)]
     return ", ".join(kept) if kept else "pixel art minecraft item"
+
+
+def caption_has_mod_clause(caption: str) -> bool:
+    return strip_mod_clause(caption) != str(caption).strip()
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    tmp = path.with_name(path.name + ".partial")
+    tmp.write_text(text)
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        shutil.copy2(tmp, path)
+        tmp.unlink(missing_ok=True)
 
 
 def resolve_token(explicit: str | None = None) -> str | None:
@@ -228,12 +251,39 @@ def write_packed_cache(ds, out_dir) -> None:
     print(f"Packed cache: {images.shape} {images.nbytes / 1e6:.0f} MB, {len(captions):,} captions")
 
 
+def rewrite_packed_captions(out_dir) -> int:
+    """Strip leftover mod clauses in captions.json / prepare_stats.json on disk."""
+    cap_path = Path(out_dir) / PACK_CAPTIONS
+    if not cap_path.exists():
+        return 0
+    raw = json.loads(cap_path.read_text())
+    captions = [strip_mod_clause(c) for c in raw]
+    n_mod = sum(a.strip() != b for a, b in zip(raw, captions))
+    if not n_mod:
+        return 0
+    print(f"Rewriting {n_mod:,} packed captions in {cap_path} (dropped 'from <mod>')")
+    _atomic_write_text(cap_path, json.dumps(captions))
+    stats_path = Path(out_dir) / "prepare_stats.json"
+    if stats_path.exists():
+        try:
+            stats = json.loads(stats_path.read_text())
+            stats["example_captions"] = [
+                strip_mod_clause(c) for c in stats.get("example_captions") or []
+            ]
+            stats["mod_clauses_stripped"] = n_mod
+            _atomic_write_text(stats_path, json.dumps(stats, indent=2))
+        except Exception as e:
+            print(f"Could not update prepare_stats.json: {e}")
+    return n_mod
+
+
 def load_packed_cache(out_dir):
     out_path = Path(out_dir)
     img_path = out_path / PACK_IMAGES
     cap_path = out_path / PACK_CAPTIONS
     if not img_path.exists() or not cap_path.exists():
         return None
+    rewrite_packed_captions(out_path)
     images = np.load(img_path)
     captions = [strip_mod_clause(c) for c in json.loads(cap_path.read_text())]
     if len(images) != len(captions):
@@ -282,8 +332,24 @@ def selftest() -> None:
     assert "diamond sword" in cap and "better end" not in cap, cap
     cap2 = caption_from_row("0.png", "coolmod")
     assert "pixel art minecraft item" in cap2 and "coolmod" not in cap2, cap2
-    stripped = strip_mod_clause("pixel art minecraft item, axe, from overworld reforged")
-    assert stripped == "pixel art minecraft item, axe", stripped
+    stripped = strip_mod_clause("pixel art minecraft item, helmet, from overworld reforged")
+    assert stripped == "pixel art minecraft item, helmet", stripped
+    assert "overworld" not in stripped
+    assert caption_has_mod_clause("pixel art minecraft item, helmet, from overworld reforged")
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        dirty = ["pixel art minecraft item, helmet, from overworld reforged"]
+        (tmp_path / PACK_CAPTIONS).write_text(json.dumps(dirty))
+        (tmp_path / "prepare_stats.json").write_text(
+            json.dumps({"example_captions": dirty})
+        )
+        n = rewrite_packed_captions(tmp_path)
+        assert n == 1, n
+        cleaned = json.loads((tmp_path / PACK_CAPTIONS).read_text())
+        assert cleaned == ["pixel art minecraft item, helmet"], cleaned
+        stats = json.loads((tmp_path / "prepare_stats.json").read_text())
+        assert "overworld" not in json.dumps(stats)
     print("selftest ok", {"item_opaque_frac": frac, "caption": cap})
 
 
