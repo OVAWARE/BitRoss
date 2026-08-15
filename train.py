@@ -231,7 +231,7 @@ def prune_epoch_checkpoints(save_dir, model_name, keep=2):
             print(f"Could not prune {old}: {e}")
 
 
-def load_or_build_packed_dataset(processed_dir, tokenizer):
+def load_or_build_packed_dataset(processed_dir, tokenizer, max_images=None):
     """Prefer images_u8.npy; otherwise decode the HF cache once and write the pack."""
     from prepare_dataset import (
         PACK_IMAGES,
@@ -258,7 +258,7 @@ def load_or_build_packed_dataset(processed_dir, tokenizer):
         if packed is None:
             raise SystemExit(f"Failed to build packed cache in {processed_dir}")
     images, captions = packed
-    from prepare_dataset import ALPHA_CUTOFF, ALPHA_HI, ALPHA_LO, caption_has_mod_clause
+    from prepare_dataset import ALPHA_CUTOFF, ALPHA_HI, ALPHA_LO, caption_has_mod_clause, select_quality_sprites
 
     opaque = (images[..., 3] > ALPHA_CUTOFF).mean(axis=(1, 2))
     keep = (opaque > ALPHA_LO) & (opaque < ALPHA_HI)
@@ -270,13 +270,20 @@ def load_or_build_packed_dataset(processed_dir, tokenizer):
         )
         images = images[keep]
         captions = [c for c, k in zip(captions, keep.tolist()) if k]
-    print(f"Packed sprites: {images.shape[0]:,}  {images.shape[1:]}  {images.nbytes / 1e6:.0f} MB")
+    print(f"Raw pack after speck filter: {images.shape[0]:,}  {images.shape[1:]}")
     leftover = [c for c in captions if caption_has_mod_clause(c)]
     if leftover:
         raise SystemExit(
             f"{len(leftover):,} captions still contain 'from <mod>' after strip "
             f"(e.g. {leftover[0]!r}). Re-run Train so git reset picks up caption sanitizing."
         )
+    images, captions, qstats = select_quality_sprites(
+        images, captions, max_keep=max_images
+    )
+    print(
+        f"Packed sprites: {images.shape[0]:,}  {images.shape[1:]}  "
+        f"{images.nbytes / 1e6:.0f} MB  (quality keep={qstats.get('kept')})"
+    )
     print("Caption samples (item name only, no mod):")
     for c in captions[:8]:
         print(f"  {c}")
@@ -640,12 +647,18 @@ def parse_args():
     )
     p.add_argument("--metadata", type=str, default=None, help="Defaults to <data_dir>/metadata.json")
     p.add_argument("--save_dir", type=str, default="./models/BitRoss/")
-    p.add_argument("--epochs", type=int, default=800)
+    p.add_argument("--epochs", type=int, default=40)
     p.add_argument(
         "--batch_size",
         type=int,
         default=0,
         help="0 = auto from GPU VRAM (1024 on L4, 256 on T4; shrinks on OOM)",
+    )
+    p.add_argument(
+        "--max_images",
+        type=int,
+        default=65536,
+        help="Keep this many highest-quality sprites (0 = all that pass the quality gate)",
     )
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--num_workers", type=int, default=0, help="0 is fastest for the packed RAM cache")
@@ -670,6 +683,13 @@ def parse_args():
     args = p.parse_args()
     if args.resume in ("", "none", "None"):
         args.resume = None
+    if args.epochs == 800:
+        print(
+            "EPOCHS=800 is the old Colab default (~days of L4). "
+            "Using 40 instead (~few hours on the quality subset). "
+            "Set the Train form to 80 or 120 if you want a longer run."
+        )
+        args.epochs = 40
     return args
 
 
@@ -800,7 +820,9 @@ def main():
 
     if args.processed_dir:
         processed_dir = localize_processed_dir(args.processed_dir)
-        dataset = load_or_build_packed_dataset(processed_dir, tokenizer)
+        dataset = load_or_build_packed_dataset(
+            processed_dir, tokenizer, max_images=args.max_images
+        )
     else:
         folder_ds = Text2ImageDataset(DATA_DIR, METADATA_FILE)
         if len(folder_ds) == 0:
@@ -887,6 +909,14 @@ def main():
         )
     else:
         train_loader = make_loader(dataset, BATCH_SIZE, device, num_workers)
+
+    steps_ep = max(1, len(dataset) // max(BATCH_SIZE, 1))
+    print(
+        f"Schedule: {len(dataset):,} images  batch={BATCH_SIZE}  "
+        f"{steps_ep:,} steps/epoch  {NUM_EPOCHS} epochs. "
+        f"At 300 img/s ≈ {len(dataset)/300:.0f}s/epoch, "
+        f"{len(dataset)/300*NUM_EPOCHS/3600:.1f} hours total."
+    )
 
     run_config = {
         "arch": "pixel-dit-flow",

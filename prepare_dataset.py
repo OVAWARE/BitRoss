@@ -48,7 +48,33 @@ JUNK_NAMES = {
     "colormap",
     "color_map",
     "destroy_stage",
+    "item",
+    "items",
+    "icon",
+    "gui",
+    "overlay",
+    "particle",
+    "layer",
+    "misc",
 }
+
+# Weak one-word names: keep a few, but rank them below specific items.
+WEAK_NAMES = {
+    "block",
+    "blocks",
+    "ingot",
+    "nugget",
+    "dust",
+    "shard",
+    "gem",
+    "ore",
+}
+
+QUALITY_ALPHA_LO = 0.08  # ~20 of 256 px; tighter than the 5% speck floor
+QUALITY_ALPHA_HI = 0.90
+MIN_OPAQUE_COLORS = 4
+MIN_BBOX_FILL = 0.28
+DEFAULT_MAX_IMAGES = 65536
 
 
 def opaque_fraction(image: Image.Image, cutoff: int = ALPHA_CUTOFF) -> float:
@@ -101,6 +127,130 @@ def strip_mod_clause(caption: str) -> str:
 
 def caption_has_mod_clause(caption: str) -> bool:
     return strip_mod_clause(caption) != str(caption).strip()
+
+
+def caption_item_name(caption: str) -> str:
+    text = strip_mod_clause(caption)
+    if "," not in text:
+        return ""
+    return text.split(",", 1)[1].strip().lower()
+
+
+def _unique_opaque_colors(images: np.ndarray, cutoff: int = ALPHA_CUTOFF) -> np.ndarray:
+    """Count distinct RGB colors among opaque pixels. 16x16, one pass per sprite."""
+    n = images.shape[0]
+    out = np.zeros(n, dtype=np.int16)
+    rgb = images[..., :3]
+    packed = (
+        rgb[..., 0].astype(np.uint32) << 16
+        | rgb[..., 1].astype(np.uint32) << 8
+        | rgb[..., 2].astype(np.uint32)
+    ).copy()
+    packed[images[..., 3] <= cutoff] = 0xFFFFFFFF
+    for i in range(n):
+        uniq = np.unique(packed[i])
+        out[i] = uniq.size - int(uniq[-1] == 0xFFFFFFFF)
+        if i and i % 100000 == 0:
+            print(f"  unique-colors {i:,}/{n:,}")
+    return out
+
+
+def _bbox_fill(alpha: np.ndarray) -> np.ndarray:
+    """Opaque pixels / bounding-box area. Specks and 1px lines score low."""
+    row_any = alpha.any(axis=2)
+    col_any = alpha.any(axis=1)
+    has = row_any.any(axis=1)
+    first_y = row_any.argmax(axis=1)
+    last_y = 15 - row_any[:, ::-1].argmax(axis=1)
+    first_x = col_any.argmax(axis=1)
+    last_x = 15 - col_any[:, ::-1].argmax(axis=1)
+    area = (last_y - first_y + 1).clip(min=1) * (last_x - first_x + 1).clip(min=1)
+    opaque_n = alpha.sum(axis=(1, 2)).astype(np.float32)
+    fill = opaque_n / area.astype(np.float32)
+    fill[~has] = 0.0
+    return fill
+
+
+def select_quality_sprites(
+    images: np.ndarray,
+    captions: list[str],
+    max_keep: int = DEFAULT_MAX_IMAGES,
+    min_colors: int = MIN_OPAQUE_COLORS,
+):
+    """Keep the strongest item silhouettes, drop exact dups, cap to max_keep.
+
+    Ranking prefers colorful, compact sprites with specific names (diamond sword)
+    over generic blobs (block, icon) and copy-pasted duplicates across mods.
+    """
+    n = len(images)
+    if n == 0:
+        return images, captions, {"kept": 0}
+    print(f"Scoring {n:,} sprites for quality (dedup + silhouette + colors)...")
+    alpha = images[..., 3] > ALPHA_CUTOFF
+    opaque = alpha.mean(axis=(1, 2))
+    colors = _unique_opaque_colors(images)
+    fill = _bbox_fill(alpha)
+    names = [caption_item_name(c) for c in captions]
+    n_words = np.array(
+        [len(nm.split()) if nm else 0 for nm in names], dtype=np.int16
+    )
+    weak = np.array(
+        [(nm in WEAK_NAMES) or (nm in JUNK_NAMES) or not nm for nm in names],
+        dtype=bool,
+    )
+    gate = (
+        (opaque > QUALITY_ALPHA_LO)
+        & (opaque < QUALITY_ALPHA_HI)
+        & (colors >= min_colors)
+        & (fill >= MIN_BBOX_FILL)
+        & (~weak | (n_words >= 2))
+    )
+    n_gate = int(gate.sum())
+    print(
+        f"  silhouette gate: {n_gate:,}/{n:,} "
+        f"(opaque {QUALITY_ALPHA_LO:.0%}-{QUALITY_ALPHA_HI:.0%}, "
+        f">={min_colors} colors, bbox fill>={MIN_BBOX_FILL:.0%}, named)"
+    )
+
+    hashes = np.empty(n, dtype=np.uint64)
+    for i in range(n):
+        hashes[i] = hash(images[i].tobytes()) & 0xFFFFFFFFFFFFFFFF
+    _, first = np.unique(hashes, return_index=True)
+    uniq = np.zeros(n, dtype=bool)
+    uniq[first] = True
+    n_dup = int((~uniq).sum())
+    print(f"  exact duplicates: {n_dup:,}")
+
+    keep_mask = gate & uniq
+    n_pass = int(keep_mask.sum())
+    # Rank: more colors, item-like occupancy (~30%), tight bbox, specific name.
+    score = (
+        colors.astype(np.float32)
+        + 8.0 * (1.0 - np.abs(opaque - 0.32))
+        + 4.0 * fill
+        + 2.0 * np.minimum(n_words, 4).astype(np.float32)
+        - 3.0 * weak.astype(np.float32)
+    )
+    idx = np.flatnonzero(keep_mask)
+    idx = idx[np.argsort(-score[idx], kind="stable")]
+    cap = n_pass if max_keep is None or max_keep <= 0 else min(n_pass, int(max_keep))
+    idx = np.sort(idx[:cap])
+    stats = {
+        "input": n,
+        "duplicates": n_dup,
+        "gate_pass": n_pass,
+        "kept": int(idx.size),
+        "max_keep": max_keep,
+        "example_kept": [captions[int(i)] for i in idx[:8]],
+    }
+    print(
+        f"Quality subset: {stats['kept']:,} sprites "
+        f"(from {n:,}; dropped {n_dup:,} dups + {n - n_gate:,} weak silhouettes/"
+        f"names, then top {cap:,} by score)"
+    )
+    for c in stats["example_kept"]:
+        print(f"  {c}")
+    return images[idx], [captions[int(i)] for i in idx], stats
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -350,7 +500,25 @@ def selftest() -> None:
         assert cleaned == ["pixel art minecraft item, helmet"], cleaned
         stats = json.loads((tmp_path / "prepare_stats.json").read_text())
         assert "overworld" not in json.dumps(stats)
-    print("selftest ok", {"item_opaque_frac": frac, "caption": cap})
+    # Quality rank: colorful named item beats a 2px speck and a duplicate.
+    good = np.zeros((16, 16, 4), dtype=np.uint8)
+    for y in range(2, 14):
+        for x in range(3, 13):
+            good[y, x] = (30 + 8 * x, 40 + 6 * y, 180, 255)
+    speck_arr = np.zeros((16, 16, 4), dtype=np.uint8)
+    speck_arr[8, 8] = (255, 0, 0, 255)
+    clone = good.copy()
+    imgs = np.stack([speck_arr, good, clone], axis=0)
+    caps = [
+        "pixel art minecraft item, speck",
+        "pixel art minecraft item, diamond sword",
+        "pixel art minecraft item, diamond sword",
+    ]
+    kept_imgs, kept_caps, q = select_quality_sprites(imgs, caps, max_keep=8)
+    assert q["kept"] == 1, q
+    assert kept_caps == ["pixel art minecraft item, diamond sword"], kept_caps
+    assert q["duplicates"] == 1, q
+    print("selftest ok", {"item_opaque_frac": frac, "caption": cap, "quality_kept": q["kept"]})
 
 
 def parse_args():
