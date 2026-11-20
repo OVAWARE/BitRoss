@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bitross"
+version = "2.0.0"
+description = "Text to 16x16 Minecraft textures with a masked discrete-diffusion pixel transformer"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.4",
+  "transformers>=4.44",
+  "numpy",
+  "pandas",
+  "pyarrow",
+  "pillow",
+  "scipy",
+  "huggingface_hub",
+]
+
+[project.optional-dependencies]
+app = ["gradio>=5"]
+label = ["vllm"]
+dev = ["pytest"]
+
+[project.scripts]
+bitross-generate = "bitross.cli:main"
+bitross-train = "bitross.train:main"
+bitross-data = "bitross.data.build:main"
+
+[tool.setuptools.packages.find]
+include = ["bitross*"]

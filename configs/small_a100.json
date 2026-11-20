@@ -1,0 +1,11 @@
+{
+  "preset": "small",
+  "batch_size": 512,
+  "total_steps": 40000,
+  "lr": 0.0006,
+  "warmup_steps": 1000,
+  "optimizer": "muon",
+  "amp_dtype": "bf16",
+  "compile": true,
+  "keep_every": 10000
+}

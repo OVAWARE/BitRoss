@@ -1,0 +1,9 @@
+torch>=2.4
+transformers>=4.44
+numpy
+pandas
+pyarrow
+pillow
+scipy
+huggingface_hub
+gradio>=5
