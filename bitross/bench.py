@@ -60,7 +60,8 @@ def main(argv=None):
     for i in range(4):
         step(i)
     torch.cuda.synchronize()
-    prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) if a.profile else contextlib.nullcontext()
+    prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                                  record_shapes=True) if a.profile else contextlib.nullcontext()
     with prof:
         t = time.time()
         n = 6 if a.profile else a.steps
@@ -70,7 +71,11 @@ def main(argv=None):
         dt = time.time() - t
     print(f"{n * B / dt:.0f} img/s, {dt / n * 1000:.0f} ms/step, peak mem {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB")
     if a.profile:
-        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=25))
+        rows = [e for e in prof.key_averages(group_by_input_shape=True) if e.key.startswith("aten::")]
+        rows.sort(key=lambda e: -e.device_time_total)
+        tot = sum(e.self_device_time_total for e in prof.key_averages())
+        for e in rows[:30]:
+            print(f"{e.device_time_total / 1e3:8.1f} ms {100 * e.device_time_total / tot:5.1f}%  x{e.count:<4d} {e.key:28s} {str(e.input_shapes)[:90]}")
 
 
 if __name__ == "__main__":
