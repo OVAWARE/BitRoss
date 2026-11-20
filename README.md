@@ -86,6 +86,38 @@ then runs **Qwen2.5-VL-3B** over every image. It returns a clean name, a one-lin
 flag and a 1–5 quality score. Images with meaningless filenames are labeled first. Each image keeps
 several caption variants, and training samples one at random.
 
+## Results (BitRoss 2 small, 48M params)
+
+Trained on one Colab L4 GPU: a 2,000-step pilot run, then 20,000 steps × batch 256 (5.6M images,
+about 8.7 epochs over the 642K training textures) in about 5 hours at ~290 img/s.
+
+| Metric | Value |
+|---|---|
+| Validation accuracy on masked pixels (50% masked) | 63.4% (NLL 1.14 nats/pixel) |
+| CLIP score, training sample prompts | 28.2 |
+| CLIP score, 20 showcase prompts | 29.0 |
+| Silhouette preserved in recolors | 100% |
+
+Item prompts, 6 samples each (`docs/showcase/items.png`):
+
+![items](docs/showcase/items.png)
+
+Seamless blocks, each tiled 3×3:
+
+![tiles](docs/showcase/blocks_tiled_3x3.png)
+
+One iron sword recolored with its silhouette locked, and a ruby material set from `material_set`:
+
+![recolor](docs/showcase/recolor_silhouette.png)
+![ruby](docs/showcase/material_set_ruby.png)
+
+Effect of the VLM captions: test run (21% VLM captions, left) vs. full run (55%, right), both at step 2,000:
+
+![captions](docs/showcase/data_comparison_step2000.png)
+
+Known weak spots: a hard palette lock with very few colors produces broken pixels, so prefer
+`prefer_colors=` or a palette tolerance. Shapeless prompts like "raw ruby chunk" come out as blobs.
+
 ## Quick start
 
 ```bash
