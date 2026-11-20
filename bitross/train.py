@@ -282,7 +282,7 @@ def train(cfg: TrainConfig) -> None:
 
     if cfg.init_from:
         ck = torch.load(cfg.init_from, map_location="cpu", weights_only=False)
-        sd = ck.get("ema") or ck.get("weights")
+        sd = ck.get("model") or ck.get("ema") or ck.get("weights")   # raw weights first (full checkpoints)
         missing, unexpected = model.load_state_dict({k: v.float() if v.is_floating_point() else v for k, v in sd.items()}, strict=False)
         print(f"initialised from {cfg.init_from} (missing {len(missing)}, unexpected {len(unexpected)})")
 
