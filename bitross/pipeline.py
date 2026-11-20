@@ -121,6 +121,7 @@ class BitRoss:
                tileable: Optional[bool] = None, quality: str = "high", steps: int = 16, cfg_scale: float = 3.0,
                temperature: float = 1.0, top_k: int = 0, top_p: float = 1.0, randomness: float = 2.0,
                polish: int = 0, seed: Optional[int] = None, palette=None, palette_tolerance: float = 0.0,
+               palette_mode: str = "soft",
                prefer_colors=None, prefer_strength: float = 2.0, init: Optional[ImageLike] = None,
                strength: float = 0.5, mask: Optional[ImageLike] = None, silhouette: Optional[ImageLike] = None,
                negative_transparent: bool = False) -> Iterator[Step]:
@@ -141,7 +142,8 @@ class BitRoss:
         qual = torch.full((B,), QUALITY_BUCKETS.index(quality if quality in QUALITY_BUCKETS else "any"), device=dev)
 
         init_t = keep = None
-        allowed = self.palette_mask(palette, palette_tolerance) if palette is not None and len(parse_colors(palette)) else None
+        has_palette = palette is not None and len(parse_colors(palette)) > 0
+        allowed = self.palette_mask(palette, palette_tolerance) if has_palette and palette_mode == "hard" else None
         if allowed is not None:
             allowed = allowed.view(1, 1, K).expand(B, N, K).clone()
         if negative_transparent:     # forbid empty pixels entirely (full-tile textures)
@@ -172,6 +174,9 @@ class BitRoss:
             allowed = allowed.to(dev)
             allowed[..., 0] &= ~sil            # inside the silhouette: no holes
         bias = self.color_bias(prefer_colors, prefer_strength) if prefer_colors is not None else None
+        if has_palette and palette_mode != "hard":     # steer toward the palette; exact snapping happens after decoding
+            pb = self.color_bias(palette, 3.0, sigma=0.08)
+            bias = pb if bias is None else bias + pb
 
         yield from sample_iter(self.model, ts, tp, typ, tile, qual, steps=steps, cfg_scale=cfg_scale,
                                temperature=temperature, top_k=top_k, top_p=top_p, randomness=randomness,
@@ -187,7 +192,10 @@ class BitRoss:
         quality      "high" | "mid" | "low" | "any"   (the quality bucket the model is conditioned on)
         steps, cfg_scale, temperature, top_k, top_p, randomness (commit-order noise), polish (refine passes)
         seed         int for reproducible results
-        palette      hard palette lock: list of hex colors / RGB tuples / a reference image
+        palette      palette lock: list of hex colors / RGB tuples / a reference image. Default
+                     palette_mode="soft" steers sampling toward the palette, then snaps every pixel
+                     to its nearest palette color (clean shapes). "hard" masks all other colors at
+                     every step (strict, but tiny palettes can break shapes).
         prefer_colors soft color steering (same formats), prefer_strength sets how hard
         init + strength      variations of an existing texture
         init + mask          inpainting: white pixels of `mask` are regenerated
@@ -201,6 +209,9 @@ class BitRoss:
         if last is None:
             raise ValueError("nothing to generate (everything was kept)")
         imgs = self.decode(last.tokens)
+        pal = kw.get("palette")
+        if pal is not None and len(parse_colors(pal)):     # exact requested colors in both modes
+            imgs = [snap_to_palette(im, pal) for im in imgs]
         if max_colors:
             imgs = [reduce_colors(im, max_colors) for im in imgs]
         if rerank:
@@ -262,6 +273,22 @@ def reduce_colors(img: "Image.Image", n: int, iters: int = 12) -> "Image.Image":
             rep[sel] = cols[sel[np.argmax(cnt[sel])]]
     out = flat.copy()
     out[vis] = rep[inv.reshape(-1)]
+    return Image.fromarray(out.reshape(a.shape), "RGBA")
+
+
+def snap_to_palette(img: "Image.Image", palette) -> "Image.Image":
+    """Map every visible pixel to the perceptually nearest color of `palette` (OKLab)."""
+    from PIL import Image
+    pal = parse_colors(palette)
+    pal = pal[pal[:, 3] > 0]
+    a = canonical_rgba(np.asarray(img.convert("RGBA")))
+    flat = a.reshape(-1, 4)
+    vis = flat[:, 3] > 0
+    if not vis.any() or len(pal) == 0:
+        return img
+    d = ((color_features(flat[vis])[:, None, :3] - color_features(pal)[None, :, :3]) ** 2).sum(-1)
+    out = flat.copy()
+    out[vis, :3] = pal[d.argmin(1), :3]
     return Image.fromarray(out.reshape(a.shape), "RGBA")
 
 

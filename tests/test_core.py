@@ -115,3 +115,15 @@ def test_reduce_colors():
     a[..., 3] = 255
     out = np.asarray(reduce_colors(Image.fromarray(a, "RGBA"), 6))
     assert len(np.unique(out.reshape(-1, 4), axis=0)) <= 6
+
+
+def test_snap_to_palette_only_uses_palette_colors():
+    from PIL import Image
+    from bitross.pipeline import parse_colors, snap_to_palette
+    a = np.random.default_rng(0).integers(0, 256, (16, 16, 4), dtype=np.uint8)
+    a[..., 3] = np.where(a[..., 3] > 100, 255, 0)
+    pal = "#1e1b2e #6a4fb3 #f2e9ff #8a6236"
+    out = np.asarray(snap_to_palette(Image.fromarray(a, "RGBA"), pal)).reshape(-1, 4)
+    vis = out[out[:, 3] > 0][:, :3]
+    allowed = {tuple(c[:3]) for c in parse_colors(pal)}
+    assert {tuple(c) for c in vis} <= allowed

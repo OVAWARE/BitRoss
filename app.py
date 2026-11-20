@@ -95,7 +95,8 @@ def build_ui(br: BitRoss) -> gr.Blocks:
                     with gr.Accordion("Colors", open=False):
                         pal = gr.Textbox(label="Palette lock (hex colors, space separated)", placeholder="#1b1b1b #6b2f2f #c4453f")
                         pal_img = gr.Image(label="…or lock to the colors of an image", type="pil", image_mode="RGBA", height=140)
-                        pal_tol = gr.Slider(0, 0.1, 0.0, step=0.005, label="Palette tolerance (OKLab)")
+                        pal_mode = gr.Radio(["soft", "hard"], value="soft", label="Palette mode (soft = steer then snap, hard = strict)")
+                        pal_tol = gr.Slider(0, 0.1, 0.0, step=0.005, label="Palette tolerance (OKLab, hard mode)")
                         prefer = gr.Textbox(label="Prefer colors (soft)", placeholder="#3fbf5f #1e7a3a")
                         maxc = gr.Slider(0, 32, 0, step=1, label="Max colors (0 = off)")
                     go = gr.Button("Generate", variant="primary")
@@ -108,7 +109,7 @@ def build_ui(br: BitRoss) -> gr.Blocks:
                         dlsheet = gr.DownloadButton("Sprite sheet")
 
             def run(prompt, kind, tile, n, seed, steps, cfg, temp, rnd, polish, quality, rerank, pal, pal_img,
-                    pal_tol, prefer, maxc):
+                    pal_mode, pal_tol, prefer, maxc):
                 lock = None
                 if pal and pal.strip():
                     lock = pal
@@ -117,7 +118,7 @@ def build_ui(br: BitRoss) -> gr.Blocks:
                 kw = dict(n=int(n), asset_type=kind, tileable=None if tile == "auto" else tile == "seamless",
                           quality=quality, steps=int(steps), cfg_scale=float(cfg), temperature=float(temp),
                           randomness=float(rnd), polish=int(polish), seed=None if seed is None or seed < 0 else int(seed),
-                          palette=lock, palette_tolerance=float(pal_tol),
+                          palette=lock, palette_tolerance=float(pal_tol), palette_mode=pal_mode,
                           prefer_colors=prefer if prefer and prefer.strip() else None)
                 t0 = time.time()
                 frame = None
@@ -126,6 +127,9 @@ def build_ui(br: BitRoss) -> gr.Blocks:
                     imgs = br.decode(st.tokens)
                     yield [show(i) for i in imgs], f"step {st.index + 1}/{st.total} ({st.phase})", [], None, None, None
                 imgs = br.decode(frame.tokens)
+                if lock is not None:
+                    from bitross.pipeline import snap_to_palette
+                    imgs = [snap_to_palette(i, lock) for i in imgs]
                 if maxc and maxc > 0:
                     from bitross.pipeline import reduce_colors
                     imgs = [reduce_colors(i, int(maxc)) for i in imgs]
@@ -142,7 +146,7 @@ def build_ui(br: BitRoss) -> gr.Blocks:
                        save_bytes(_png(sprite_sheet(imgs, cols=min(8, len(imgs)))), f"{base}_sheet.png"))
 
             go.click(run, [prompt, kind, tile, n, seed, steps, cfg, temp, rnd, polish, quality, rerank, pal, pal_img,
-                           pal_tol, prefer, maxc], [gallery, status, last, dl16, dlbig, dlsheet])
+                           pal_mode, pal_tol, prefer, maxc], [gallery, status, last, dl16, dlbig, dlsheet])
 
         # ------------------------------------------------------------------ Edit
         with gr.Tab("Edit"):
