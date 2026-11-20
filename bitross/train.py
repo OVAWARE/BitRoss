@@ -342,7 +342,7 @@ def train(cfg: TrainConfig) -> None:
             if wandb:
                 wandb.log(rec, step=step)
         if step % cfg.eval_every == 0 or step == cfg.total_steps:
-            ev = evaluate(ema, val_data, te, smooth, amp)
+            ev = evaluate(ema, val_data, te, smooth, amp, cfg.eval_batches, cfg.eval_batch_size)
             ev["step"] = step
             print("eval", json.dumps(ev), flush=True)
             log_f.write(json.dumps(ev) + "\n")

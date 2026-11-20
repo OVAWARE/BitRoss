@@ -155,6 +155,8 @@ class TrainConfig:
     # logging
     log_every: int = 50
     eval_every: int = 2_000
+    eval_batches: int = 4
+    eval_batch_size: int = 256
     sample_every: int = 2_000
     ckpt_every_steps: int = 2_000
     ckpt_every_minutes: float = 15.0
