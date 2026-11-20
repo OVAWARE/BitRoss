@@ -72,7 +72,11 @@ def parse_reply(text: str) -> Optional[Dict]:
         out["name"] = re.sub(r"[^a-z0-9 '\-]", "", name).strip()
     if cap and len(cap) <= 160:
         cap = re.sub(r"(?i)\b(in )?(minecraft|pixel[- ]art)( style)?\b|\b16x16\b|\bpixelated( edges)?\b", "", cap)
-        out["caption"] = re.sub(r"\s+", " ", cap).strip(" ,.")
+        cap = re.sub(r"\s+", " ", cap).strip(" ,.")
+        words = cap.split(" ")
+        while words and words[-1].lower() in {"with", "and", "in", "of", "on", "a", "an", "the", "its"}:
+            words.pop()
+        out["caption"] = " ".join(words).strip(" ,.")
     try:
         out["quality"] = int(np.clip(int(float(d.get("quality", 3))), 1, 5))
     except (TypeError, ValueError):
