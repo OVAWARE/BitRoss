@@ -25,6 +25,7 @@ from bitross.pipeline import parse_colors, seam_score, tile_preview, upscale
 CSS = """
 .pixel img, .pixel canvas { image-rendering: pixelated !important; image-rendering: crisp-edges !important; }
 #title { text-align: center; margin-bottom: 0; }
+.tex16 img { width: 256px !important; height: 256px !important; object-fit: contain; }
 #subtitle { text-align: center; opacity: .75; margin-top: 0; }
 """
 SHOW = 16  # display upscale factor
@@ -93,7 +94,7 @@ def build_ui(br: BitRoss) -> gr.Blocks:
                         rerank = gr.Checkbox(False, label="Sort results by CLIP score")
                     with gr.Accordion("Colors", open=False):
                         pal = gr.Textbox(label="Palette lock (hex colors, space separated)", placeholder="#1b1b1b #6b2f2f #c4453f")
-                        pal_img = gr.Image(label="…or lock to the colors of an image", type="pil", image_mode="RGBA", height=120)
+                        pal_img = gr.Image(label="…or lock to the colors of an image", type="pil", image_mode="RGBA", height=140)
                         pal_tol = gr.Slider(0, 0.1, 0.0, step=0.005, label="Palette tolerance (OKLab)")
                         prefer = gr.Textbox(label="Prefer colors (soft)", placeholder="#3fbf5f #1e7a3a")
                         maxc = gr.Slider(0, 32, 0, step=1, label="Max colors (0 = off)")
@@ -152,7 +153,7 @@ def build_ui(br: BitRoss) -> gr.Blocks:
                 with gr.Column():
                     pick = gr.Number(0, label="Use result # from Create", precision=0)
                     use = gr.Button("Load result")
-                    src = gr.Image(label="Source (16×16)", type="pil", image_mode="RGBA", elem_classes="pixel", height=256)
+                    src = gr.Image(label="Source (16×16)", type="pil", image_mode="RGBA", elem_classes=["pixel", "tex16"], height=280)
                     eprompt = gr.Textbox(label="Prompt", value="emerald sword")
                     ekind = gr.Radio(["item", "block", "any"], value="item", label="Type")
                     strength = gr.Slider(0.05, 1.0, 0.4, step=0.05, label="Variation strength")
@@ -248,7 +249,7 @@ def build_ui(br: BitRoss) -> gr.Blocks:
         # ------------------------------------------------------------------ Tiling
         with gr.Tab("Tiling check"):
             with gr.Row():
-                timg = gr.Image(label="Texture", type="pil", image_mode="RGBA", height=256, elem_classes="pixel")
+                timg = gr.Image(label="Texture", type="pil", image_mode="RGBA", height=280, elem_classes=["pixel", "tex16"])
                 tout = gr.Image(label="3×3 preview", elem_classes="pixel", height=420)
             tmsg = gr.Markdown()
             tpick = gr.Number(0, label="Use result # from Create", precision=0)
