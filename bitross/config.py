@@ -163,6 +163,7 @@ class TrainConfig:
     keep_every: int = 20_000
     sample_steps: int = 16
     sample_cfg: float = 3.0
+    clip_score: bool = True                  # CLIP similarity of the sample grid vs. its prompts
     sample_prompts: List[str] = field(default_factory=lambda: list(SAMPLE_PROMPTS))
     wandb_project: Optional[str] = None
     resume: bool = True

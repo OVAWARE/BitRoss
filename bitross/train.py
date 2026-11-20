@@ -225,6 +225,33 @@ def sample_grid(model, te: TextEncoder, palette: Palette, prompts, path: str, st
         sheet.alpha_composite(im, (pad + (i % per_prompt) * (S + pad), pad + (i // per_prompt) * (S + pad)))
     sheet.save(path)
     model.train()
+    return rgba, texts
+
+
+class ClipScorer:
+    """Mean CLIP similarity (x100) between generated textures and their prompts."""
+
+    def __init__(self, name: str, device):
+        from transformers import CLIPModel, CLIPProcessor
+        from transformers.utils import logging as hf_logging
+        hf_logging.set_verbosity_error()
+        self.model = CLIPModel.from_pretrained(name).to(device).eval().requires_grad_(False)
+        self.proc = CLIPProcessor.from_pretrained(name)
+        self.device = device
+
+    @torch.no_grad()
+    def __call__(self, rgba: np.ndarray, texts) -> float:
+        from PIL import Image
+        ims = []
+        for a in rgba:
+            bg = Image.new("RGBA", (224, 224), (150, 150, 150, 255))
+            bg.alpha_composite(Image.fromarray(a, "RGBA").resize((224, 224), Image.NEAREST))
+            ims.append(bg.convert("RGB"))
+        inp = self.proc(text=list(texts), images=ims, return_tensors="pt", padding=True).to(self.device)
+        out = self.model(**inp)
+        a = torch.nn.functional.normalize(out.image_embeds, dim=-1)
+        b = torch.nn.functional.normalize(out.text_embeds, dim=-1)
+        return float(100 * (a * b).sum(-1).mean())
 
 
 # ------------------------------------------------------------------------------------------
@@ -287,6 +314,7 @@ def train(cfg: TrainConfig) -> None:
         wandb.init(project=cfg.wandb_project, config=cfg.to_dict(), resume="allow",
                    id=os.path.basename(os.path.normpath(cfg.out_dir)))
     log_f = open(os.path.join(cfg.out_dir, "metrics.jsonl"), "a")
+    clip_scorer = None
     t_last, t_ckpt = time.time(), time.time()
     seen = 0
     model.train()
@@ -350,9 +378,20 @@ def train(cfg: TrainConfig) -> None:
                 wandb.log(ev, step=step)
         if step % cfg.sample_every == 0 or step == cfg.total_steps:
             p = os.path.join(cfg.out_dir, "samples", f"step_{step:07d}.png")
-            sample_grid(ema, te, palette, cfg.sample_prompts, p, cfg.sample_steps, cfg.sample_cfg, amp_dtype=amp_dtype)
+            rgba, texts = sample_grid(ema, te, palette, cfg.sample_prompts, p, cfg.sample_steps, cfg.sample_cfg,
+                                      amp_dtype=amp_dtype)
+            rec = {"step": step}
+            if cfg.clip_score:
+                try:
+                    if clip_scorer is None:
+                        clip_scorer = ClipScorer(cfg.text_encoder, dev)
+                    rec["clip_score"] = clip_scorer(rgba, texts)
+                    print(f"clip score {rec['clip_score']:.2f}", flush=True)
+                except Exception as e:  # never let the metric kill a long run
+                    print("clip score failed:", e)
+            log_f.write(json.dumps(rec) + "\n")
             if wandb:
-                wandb.log({"samples": wandb.Image(p)}, step=step)
+                wandb.log({"samples": wandb.Image(p), **rec}, step=step)
         due = (step % cfg.ckpt_every_steps == 0) or (time.time() - t_ckpt > cfg.ckpt_every_minutes * 60) \
             or step == cfg.total_steps
         if due:
