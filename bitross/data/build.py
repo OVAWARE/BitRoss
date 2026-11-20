@@ -281,35 +281,36 @@ def _article_free(s: str) -> str:
 
 
 def caption_variants(row: Dict, vlm: Optional[Dict]) -> List[str]:
-    """All the ways an image can be described. The trainer samples one per step."""
-    name = (vlm or {}).get("name") or (row["name"] if row["meaningful"] else "")
-    name = name.strip().lower()
+    """All the ways an image can be described. The trainer samples one per step
+    (and picks the VLM caption, always first when present, more often).
+
+    Both the filename name (the mod author's ground truth, e.g. 'benitoite sword') and the VLM's
+    visual name are used, so the model learns mod vocabulary *and* plain visual descriptions."""
     colors = [c for c in (row.get("colors") or "").split(", ") if c]
     kind = "block" if row["type"] == "block" else "item"
     faces = row.get("faces") or ""
+    names = []
+    if row["meaningful"] and row.get("name"):
+        names.append(row["name"].strip().lower())
+    if vlm and vlm.get("name"):
+        names.append(vlm["name"].strip().lower())
     out = []
     if vlm and vlm.get("caption"):
         out.append(_article_free(vlm["caption"]))
-    if name:
+    for i, name in enumerate(dict.fromkeys(n for n in names if n)):
         n = f"{name} ({faces})" if faces and kind == "block" else name
         out.append(n)
         if colors:
             out.append(f"{n}, {' and '.join(colors[:2])}")
             if colors[0].split()[-1] not in name:
                 out.append(f"{colors[0]} {name}")
-        if row.get("category"):
+        if i == 0 and row.get("category"):
             out.append(f"{name}, {row['category']}")
     if not out:
         col = " and ".join(colors[:2]) or "colorful"
         cat = row.get("category") or kind
         out.append(f"{col} {cat} texture")
-    # dedupe preserving order
-    seen, res = set(), []
-    for o in out:
-        if o and o not in seen:
-            seen.add(o)
-            res.append(o)
-    return res
+    return list(dict.fromkeys(o for o in out if o))
 
 
 def load_vlm_labels(path: Optional[str]) -> Dict[int, Dict]:
@@ -359,7 +360,8 @@ def cache_stage(work: str, out: str, vlm_labels: Optional[str] = None, val_frac:
         "license": m.get("license"), "type": m["type"], "tile_mode": m["tile_mode"],
         "quality": m["quality"], "quality_bucket": m["quality_bucket"], "weight": m["weight"],
         "category": m["category"], "colors": m["colors"], "name": [
-            (labels.get(int(r["source_index"])) or {}).get("name") or r["name"] for r in rows],
+            r["name"] if r["meaningful"] else ((labels.get(int(r["source_index"])) or {}).get("name") or r["name"])
+            for r in rows],
         "captions": [json.dumps(c) for c in caps], "split": split,
         "has_vlm": [bool((labels.get(int(r["source_index"])) or {}).get("caption")) for r in rows],
     })
