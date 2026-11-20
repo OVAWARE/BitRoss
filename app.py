@@ -82,7 +82,8 @@ def build_ui(br: BitRoss) -> gr.Blocks:
                         kind = gr.Radio(["item", "block", "any"], value="item", label="Type")
                         tile = gr.Radio(["auto", "seamless", "standalone"], value="auto", label="Tiling")
                     with gr.Row():
-                        n = gr.Slider(1, 16, 8, step=1, label="Images")
+                        n = gr.Slider(1, 16, 8 if br.device.type == "cuda" else 4, step=1,
+                                      label="Images" + ("" if br.device.type == "cuda" else " (CPU: ~6 s each)"))
                         seed = gr.Number(-1, label="Seed (-1 = random)", precision=0)
                     with gr.Accordion("Sampling", open=False):
                         steps = gr.Slider(4, 48, 16, step=1, label="Steps")
