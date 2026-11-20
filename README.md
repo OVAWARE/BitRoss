@@ -115,8 +115,9 @@ Effect of the VLM captions: test run (21% VLM captions, left) vs. full run (55%,
 
 ![captions](docs/showcase/data_comparison_step2000.png)
 
-Known weak spots: a hard palette lock with very few colors produces broken pixels, so prefer
-`prefer_colors=` or a palette tolerance. Shapeless prompts like "raw ruby chunk" come out as blobs.
+Known weak spots: shapeless prompts like "raw ruby chunk" come out as blobs. A strict
+`palette_mode="hard"` lock with very few colors can break shapes. The default `"soft"` mode avoids
+this: it steers sampling toward the palette, then snaps every pixel to the exact requested colors.
 
 ## Quick start
 
@@ -134,7 +135,7 @@ br.generate("mossy cobblestone", asset_type="block", tileable=True)
 br.generate("emerald sword", silhouette=sword)                 # same shape, new material
 br.generate("ruby sword", init=sword, strength=0.4)            # variations
 br.generate("sword with a golden hilt", init=sword, mask=m)    # inpaint white pixels of m
-br.generate("magic staff", palette="#2b1d0e #7a4b23 #43e0ff")  # hard palette lock
+br.generate("magic staff", palette="#2b1d0e #7a4b23 #43e0ff")  # palette lock (exact colors)
 br.generate("frost wand", prefer_colors=ice_texture)           # soft color steering
 br.generate("apple", n=16, rerank=True, keep_top=4)            # CLIP re-ranking
 
