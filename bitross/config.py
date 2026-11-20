@@ -142,7 +142,7 @@ class TrainConfig:
     cfg_drop_text: float = 0.1
     cfg_drop_meta: float = 0.3               # drop each metadata field independently
     hflip_prob: float = 0.5
-    rot_prob_blocks: float = 0.25            # random 90-degree rotations for tileable blocks
+    rot_prob_blocks: float = 0.0             # 90-degree rotations of tileable blocks (off: grain direction matters)
     roll_prob_tileable: float = 0.5          # random toroidal shifts for tileable blocks
     sample_weight_power: float = 1.0         # use manifest weights (rebalancing) ^ power
 
