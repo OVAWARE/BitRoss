@@ -24,7 +24,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-DEFAULT_MODEL = "Qwen/Qwen2.5-VL-3B-Instruct"
+DEFAULT_MODEL = "Qwen/Qwen3-VL-4B-Instruct"   # best quality/speed on an L4 with --quantization fp8
 
 # The instructions live in the system prompt so every request shares one long cached prefix;
 # only the image and a one-line hint differ per request.
@@ -71,7 +71,7 @@ def parse_reply(text: str) -> Optional[Dict]:
     if name and len(name) <= 48:
         out["name"] = re.sub(r"[^a-z0-9 '\-]", "", name).strip()
     if cap and len(cap) <= 160:
-        cap = re.sub(r"(?i)\b(minecraft|pixel[- ]art|pixelated|texture|sprite|16x16|icon)\b", "", cap)
+        cap = re.sub(r"(?i)\b(in )?(minecraft|pixel[- ]art)( style)?\b|\b16x16\b|\bpixelated( edges)?\b", "", cap)
         out["caption"] = re.sub(r"\s+", " ", cap).strip(" ,.")
     try:
         out["quality"] = int(np.clip(int(float(d.get("quality", 3))), 1, 5))
@@ -81,13 +81,13 @@ def parse_reply(text: str) -> Optional[Dict]:
 
 
 class VLLMBackend:
-    def __init__(self, model: str, max_batch: int = 256, gpu_mem: float = 0.88):
+    def __init__(self, model: str, max_batch: int = 256, gpu_mem: float = 0.88, quantization: Optional[str] = None):
         from transformers import AutoProcessor
         from vllm import LLM, SamplingParams
         self.proc = AutoProcessor.from_pretrained(model)
         self.llm = LLM(model=model, max_model_len=1024, limit_mm_per_prompt={"image": 1, "video": 0},
                        gpu_memory_utilization=gpu_mem, max_num_seqs=max_batch, dtype="bfloat16",
-                       enable_prefix_caching=True)
+                       enable_prefix_caching=True, **({"quantization": quantization} if quantization else {}))
         self.sp = SamplingParams(temperature=0.2, top_p=0.9, max_tokens=80, stop=["}"], include_stop_str_in_output=True)
 
     def prompt(self, question: str) -> str:
@@ -125,7 +125,8 @@ class HFBackend:
 
 def run(work: str, out: str, model: str = DEFAULT_MODEL, shard_size: int = 20000, batch: int = 512,
         backend: str = "vllm", limit: Optional[int] = None, only_unnamed_first: bool = True,
-        shards: Optional[List[int]] = None) -> None:
+        shards: Optional[List[int]] = None, gpu_mem: float = 0.88, quantization: Optional[str] = None,
+        worker: int = 0, n_workers: int = 1) -> None:
     os.makedirs(out, exist_ok=True)
     m = pd.read_parquet(os.path.join(work, "filtered.parquet"),
                         columns=["source_index", "file_name", "mod_slug", "type", "keep", "meaningful"])
@@ -137,12 +138,13 @@ def run(work: str, out: str, model: str = DEFAULT_MODEL, shard_size: int = 20000
         m = m.iloc[:limit]
     px = np.load(os.path.join(work, "pixels.npy"), mmap_mode="r")
     n_shards = (len(m) + shard_size - 1) // shard_size
-    todo = [s for s in range(n_shards) if (shards is None or s in shards)
+    todo = [s for s in range(n_shards) if (shards is None or s in shards) and s % n_workers == worker
             and not os.path.exists(os.path.join(out, f"labels_{s:04d}.jsonl"))]
     print(f"{len(m):,} images, {n_shards} shards, {len(todo)} to do")
     if not todo:
         return
-    vlm = VLLMBackend(model, max_batch=min(batch, 512)) if backend == "vllm" else HFBackend(model)
+    vlm = VLLMBackend(model, max_batch=min(batch, 512), gpu_mem=gpu_mem, quantization=quantization) \
+        if backend == "vllm" else HFBackend(model)
     for s in todo:
         part = m.iloc[s * shard_size:(s + 1) * shard_size]
         t0 = time.time()
@@ -181,8 +183,13 @@ def main(argv=None):
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--shards", type=int, nargs="*", default=None)
+    ap.add_argument("--gpu-mem", type=float, default=0.88, help="vLLM memory share (lower it when running several workers)")
+    ap.add_argument("--quantization", default=None, help="e.g. fp8 (L4/H100) for ~1.3x speed")
+    ap.add_argument("--worker", type=int, default=0, help="this process handles shards where shard %% n_workers == worker")
+    ap.add_argument("--n-workers", type=int, default=1)
     a = ap.parse_args(argv)
-    run(a.work, a.out, a.model, a.shard_size, a.batch, a.backend, a.limit, shards=a.shards)
+    run(a.work, a.out, a.model, a.shard_size, a.batch, a.backend, a.limit, shards=a.shards, gpu_mem=a.gpu_mem,
+        quantization=a.quantization, worker=a.worker, n_workers=a.n_workers)
 
 
 if __name__ == "__main__":
