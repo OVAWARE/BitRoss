@@ -40,7 +40,7 @@ QUESTION = (
     '"quality": 1-5 rating of how clean and readable the art is.'
 )
 
-_JSON = re.compile(r"\{.*\}", re.S)
+_JSON = re.compile(r"\{[^{}]*\}", re.S)
 
 
 def render(rgba: np.ndarray, size: int = 224, bg=(150, 150, 150)) -> "Image.Image":
@@ -87,7 +87,7 @@ class VLLMBackend:
         self.proc = AutoProcessor.from_pretrained(model)
         self.llm = LLM(model=model, max_model_len=1024, limit_mm_per_prompt={"image": 1},
                        gpu_memory_utilization=gpu_mem, max_num_seqs=max_batch, dtype="bfloat16")
-        self.sp = SamplingParams(temperature=0.2, top_p=0.9, max_tokens=96, stop=["\n"])
+        self.sp = SamplingParams(temperature=0.2, top_p=0.9, max_tokens=128, stop=["}"], include_stop_str_in_output=True)
 
     def prompt(self, question: str) -> str:
         msgs = [{"role": "system", "content": SYSTEM},
@@ -119,7 +119,7 @@ class HFBackend:
         with self.torch.no_grad():
             out = self.model.generate(**inp, max_new_tokens=96, do_sample=False)
         out = out[:, inp["input_ids"].shape[1]:]
-        return [t.split("\n")[0] for t in self.proc.batch_decode(out, skip_special_tokens=True)]
+        return self.proc.batch_decode(out, skip_special_tokens=True)
 
 
 def run(work: str, out: str, model: str = DEFAULT_MODEL, shard_size: int = 20000, batch: int = 512,
@@ -152,6 +152,8 @@ def run(work: str, out: str, model: str = DEFAULT_MODEL, shard_size: int = 20000
             qs = [QUESTION.format(file=r.file_name, mod=r.mod_slug or "unknown", kind=r.type or "item")
                   for r in rows.itertuples()]
             replies = vlm(imgs, qs)
+            if b == 0 and s == todo[0]:
+                print("example replies:", replies[:3], flush=True)
             for r, rep in zip(rows.itertuples(), replies):
                 d = parse_reply(rep)
                 if d is None:
