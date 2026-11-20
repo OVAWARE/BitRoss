@@ -26,24 +26,26 @@ import pandas as pd
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-VL-3B-Instruct"
 
-SYSTEM = ("You label small game textures (items and blocks from Minecraft mods) for a text-to-image dataset. "
-          "Be concrete and visual. Never mention Minecraft, pixel art, textures, sprites, icons or resolution.")
-
-QUESTION = (
-    "Hint: the file is named '{file}' from the mod '{mod}' and is a {kind} texture. The hint can be wrong or "
-    "meaningless; trust the picture.\n"
-    "Reply with ONE line of JSON and nothing else, with keys:\n"
-    '"name": what it is in 1-4 lowercase words (e.g. "ruby pickaxe", "mossy stone bricks", "cooked salmon"),\n'
-    '"caption": one short phrase of 5-14 words describing the object, its colors and material,\n'
-    '"valid": false only if this is not a usable standalone picture (a UI element, a fragment of a larger '
-    'image, an overlay, random noise, a letter or number), otherwise true,\n'
-    '"quality": 1-5 rating of how clean and readable the art is.'
+# The instructions live in the system prompt so every request shares one long cached prefix;
+# only the image and a one-line hint differ per request.
+SYSTEM = (
+    "You caption small game textures (items and blocks from Minecraft mods) for a text-to-image dataset. "
+    "Each request shows one texture plus a hint with its file name, mod and type. The hint can be wrong or "
+    "meaningless (numbers, abbreviations); trust the picture, but use the hint to identify the object when it fits.\n"
+    "Answer with exactly one line of compact JSON and nothing else:\n"
+    '{"name":"<what it is, 1-4 lowercase words>","caption":"<5-14 words: the object, its colors and material>","quality":<1-5>}\n'
+    'Examples: {"name":"ruby pickaxe","caption":"pickaxe with a red ruby head and a wooden handle","quality":4} '
+    '{"name":"mossy stone bricks","caption":"gray stone bricks covered in patches of green moss","quality":5}\n'
+    "quality rates how clean and readable the art is (1 = noise or an unreadable fragment, 5 = crisp and clear). "
+    "Never mention Minecraft, pixel art, textures, sprites, icons or resolution."
 )
+
+QUESTION = "file: {file} | mod: {mod} | type: {kind}"
 
 _JSON = re.compile(r"\{[^{}]*\}", re.S)
 
 
-def render(rgba: np.ndarray, size: int = 224, bg=(150, 150, 150)) -> "Image.Image":
+def render(rgba: np.ndarray, size: int = 128, bg=(150, 150, 150)) -> "Image.Image":
     from PIL import Image
     im = Image.fromarray(np.asarray(rgba, np.uint8), "RGBA").resize((size, size), Image.NEAREST)
     base = Image.new("RGBA", (size, size), (*bg, 255))
@@ -71,8 +73,6 @@ def parse_reply(text: str) -> Optional[Dict]:
     if cap and len(cap) <= 160:
         cap = re.sub(r"(?i)\b(minecraft|pixel[- ]art|pixelated|texture|sprite|16x16|icon)\b", "", cap)
         out["caption"] = re.sub(r"\s+", " ", cap).strip(" ,.")
-    v = d.get("valid", True)
-    out["valid"] = not (v is False or str(v).lower() == "false")
     try:
         out["quality"] = int(np.clip(int(float(d.get("quality", 3))), 1, 5))
     except (TypeError, ValueError):
@@ -85,9 +85,10 @@ class VLLMBackend:
         from transformers import AutoProcessor
         from vllm import LLM, SamplingParams
         self.proc = AutoProcessor.from_pretrained(model)
-        self.llm = LLM(model=model, max_model_len=1024, limit_mm_per_prompt={"image": 1},
-                       gpu_memory_utilization=gpu_mem, max_num_seqs=max_batch, dtype="bfloat16")
-        self.sp = SamplingParams(temperature=0.2, top_p=0.9, max_tokens=128, stop=["}"], include_stop_str_in_output=True)
+        self.llm = LLM(model=model, max_model_len=1024, limit_mm_per_prompt={"image": 1, "video": 0},
+                       gpu_memory_utilization=gpu_mem, max_num_seqs=max_batch, dtype="bfloat16",
+                       enable_prefix_caching=True)
+        self.sp = SamplingParams(temperature=0.2, top_p=0.9, max_tokens=80, stop=["}"], include_stop_str_in_output=True)
 
     def prompt(self, question: str) -> str:
         msgs = [{"role": "system", "content": SYSTEM},
@@ -117,7 +118,7 @@ class HFBackend:
         prompts = [self.proc.apply_chat_template(m, tokenize=False, add_generation_prompt=True) for m in msgs]
         inp = self.proc(text=prompts, images=list(images), return_tensors="pt", padding=True).to("cuda")
         with self.torch.no_grad():
-            out = self.model.generate(**inp, max_new_tokens=96, do_sample=False)
+            out = self.model.generate(**inp, max_new_tokens=80, do_sample=False)
         out = out[:, inp["input_ids"].shape[1]:]
         return self.proc.batch_decode(out, skip_special_tokens=True)
 

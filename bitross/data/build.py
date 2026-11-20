@@ -331,7 +331,7 @@ def load_vlm_labels(path: Optional[str]) -> Dict[int, Dict]:
 
 
 def cache_stage(work: str, out: str, vlm_labels: Optional[str] = None, val_frac: float = 0.01,
-                min_vlm_quality: int = 2, seed: int = 0) -> None:
+                min_vlm_quality: int = 0, seed: int = 0) -> None:
     os.makedirs(out, exist_ok=True)
     m = pd.read_parquet(os.path.join(work, "filtered.parquet"))
     m = m[m["keep"]].reset_index(drop=True)
