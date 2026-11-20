@@ -33,6 +33,7 @@ class ModelConfig:
     local_conv: bool = True       # depthwise 3x3 conv inside the FFN (tile-aware padding)
     color_freqs: int = 6
     self_cond: bool = True
+    low_precision_residual: bool = False  # keep the residual stream in bf16 under autocast (faster)
     n_asset_types: int = len(ASSET_TYPES)
     n_tile_modes: int = len(TILE_MODES)
     n_quality: int = len(QUALITY_BUCKETS)

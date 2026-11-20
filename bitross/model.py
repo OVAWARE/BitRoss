@@ -101,10 +101,11 @@ class LocalFFN(nn.Module):
         if self.dw is not None:
             B, _, C = gate.shape
             img = gate[:, n_prefix:].transpose(1, 2).reshape(B, C, side, side)
-            pz = F.pad(img, (1, 1, 1, 1))
-            if wrap is not None:
-                pc = F.pad(img, (1, 1, 1, 1), mode="circular")
-                pz = torch.where(wrap.view(B, 1, 1, 1), pc, pz)
+            # 1-pixel border: wrapped-around neighbours for tileable samples, zeros otherwise
+            w = (wrap.view(B, 1, 1, 1) if wrap is not None else torch.zeros(B, 1, 1, 1, dtype=torch.bool,
+                                                                               device=img.device)).to(img.dtype)
+            mid = torch.cat([img[:, :, -1:] * w, img, img[:, :, :1] * w], 2)
+            pz = torch.cat([mid[..., -1:] * w, mid, mid[..., :1] * w], 3)
             conv = F.conv2d(pz, self.dw.to(pz.dtype), self.dw_b.to(pz.dtype), groups=C)
             conv = conv.flatten(2).transpose(1, 2)
             gate = torch.cat([gate[:, :n_prefix], gate[:, n_prefix:] + conv], 1)
@@ -121,7 +122,7 @@ class Block(nn.Module):
         self.mod_offset = nn.Parameter(torch.zeros(6, cfg.dim))
 
     def forward(self, x, mod, cos, sin, n_prefix: int, side: int, wrap):
-        sh1, sc1, g1, sh2, sc2, g2 = (mod + self.mod_offset).unsqueeze(2).unbind(1)
+        sh1, sc1, g1, sh2, sc2, g2 = (mod + self.mod_offset).to(x.dtype).unsqueeze(2).unbind(1)
         x = x + g1 * self.attn(self.n1(x) * (1 + sc1) + sh1, cos, sin)
         x = x + g2 * self.ffn(self.n2(x) * (1 + sc2) + sh2, n_prefix, side, wrap)
         return x
@@ -269,6 +270,8 @@ class BitRossModel(nn.Module):
 
         n_pre = self.n_prefix
         xs = torch.cat([self.registers.expand(B, -1, -1).to(h.dtype), t.to(h.dtype), h], 1)
+        if cfg.low_precision_residual and torch.is_autocast_enabled(xs.device.type):
+            xs = xs.to(torch.get_autocast_dtype(xs.device.type))      # halve activation memory traffic
         for blk in self.enc:
             xs = self._block(blk, xs, mod, self.cos_full, self.sin_full, n_pre, G, wrap)
         if cfg.hourglass:
@@ -276,12 +279,12 @@ class BitRossModel(nn.Module):
             xs = torch.cat([pre, self._merge(img)], 1)
             for blk in self.mid:
                 xs = self._block(blk, xs, mod, self.cos_mid, self.sin_mid, n_pre, G // cfg.merge, wrap)
-            xs = torch.cat([xs[:, :n_pre], img + self._split(xs[:, n_pre:])], 1)
+            xs = torch.cat([xs[:, :n_pre], img + self._split(xs[:, n_pre:]).to(img.dtype)], 1)
             for blk in self.dec:
                 xs = self._block(blk, xs, mod, self.cos_full, self.sin_full, n_pre, G, wrap)
         img = xs[:, n_pre:]
         shift, scale = self.out_mod(c).unsqueeze(1).chunk(2, -1)
-        return self.head(self.out_norm(img) * (1 + scale) + shift).float()
+        return self.head(self.out_norm(img) * (1 + scale.to(img.dtype)) + shift.to(img.dtype)).float()
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
