@@ -120,7 +120,7 @@ class TrainConfig:
     init_from: Optional[str] = None          # fine-tune from an existing checkpoint
 
     # optimisation
-    batch_size: int = 384
+    batch_size: int = 256
     grad_accum: int = 1
     total_steps: int = 60_000
     lr: float = 6e-4

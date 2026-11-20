@@ -1,6 +1,6 @@
 {
   "preset": "small",
-  "batch_size": 384,
+  "batch_size": 256,
   "total_steps": 30000,
   "lr": 0.0006,
   "warmup_steps": 1000,
