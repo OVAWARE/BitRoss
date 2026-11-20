@@ -316,7 +316,7 @@ def load_vlm_labels(path: Optional[str]) -> Dict[int, Dict]:
     labels: Dict[int, Dict] = {}
     if not path:
         return labels
-    for p in sorted(glob.glob(path)):
+    for p in sorted(glob.glob(path, recursive=True)):
         with open(p) as f:
             for line in f:
                 line = line.strip()

@@ -130,11 +130,25 @@ class HFBackend:
 def run(work: str, out: str, model: str = DEFAULT_MODEL, shard_size: int = 20000, batch: int = 512,
         backend: str = "vllm", limit: Optional[int] = None, only_unnamed_first: bool = True,
         shards: Optional[List[int]] = None, gpu_mem: float = 0.88, quantization: Optional[str] = None,
-        worker: int = 0, n_workers: int = 1) -> None:
+        worker: int = 0, n_workers: int = 1, subset: str = "all", skip_labeled: Optional[str] = None) -> None:
     os.makedirs(out, exist_ok=True)
     m = pd.read_parquet(os.path.join(work, "filtered.parquet"),
                         columns=["source_index", "file_name", "mod_slug", "type", "keep", "meaningful"])
     m = m[m["keep"]]
+    if subset == "items_and_unnamed":       # named blocks keep their (usually good) filename captions
+        m = m[(m["type"] != "block") | ~m["meaningful"]]
+    if skip_labeled:
+        import glob as _glob
+        done = set()
+        for p in _glob.glob(skip_labeled, recursive=True):
+            with open(p) as f:
+                for line in f:
+                    try:
+                        done.add(int(json.loads(line)["source_index"]))
+                    except (ValueError, KeyError):
+                        pass
+        m = m[~m["source_index"].isin(done)]
+        print(f"skipping {len(done):,} already-labeled images")
     if only_unnamed_first:   # label the images whose file names say nothing first
         m = m.sort_values("meaningful", kind="stable")
     m = m.reset_index(drop=True)
@@ -191,9 +205,12 @@ def main(argv=None):
     ap.add_argument("--quantization", default=None, help="e.g. fp8 (L4/H100) for ~1.3x speed")
     ap.add_argument("--worker", type=int, default=0, help="this process handles shards where shard %% n_workers == worker")
     ap.add_argument("--n-workers", type=int, default=1)
+    ap.add_argument("--subset", choices=["all", "items_and_unnamed"], default="all")
+    ap.add_argument("--skip-labeled", default=None, help="glob of label files whose images are skipped")
     a = ap.parse_args(argv)
     run(a.work, a.out, a.model, a.shard_size, a.batch, a.backend, a.limit, shards=a.shards, gpu_mem=a.gpu_mem,
-        quantization=a.quantization, worker=a.worker, n_workers=a.n_workers)
+        quantization=a.quantization, worker=a.worker, n_workers=a.n_workers, subset=a.subset,
+        skip_labeled=a.skip_labeled)
 
 
 if __name__ == "__main__":
